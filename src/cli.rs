@@ -5,7 +5,7 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 pub(crate) struct Args {
-    /// Directory containing AMReX plotfile directories or .packed files.
+    /// Directory containing AMReX plotfiles, .packed files, or .compact files.
     pub(crate) dir: PathBuf,
 
     /// Convert plotfiles to .packed files and exit.

@@ -29,6 +29,7 @@ pub(crate) fn convert_directory(dir: &Path, quantities: &[String]) -> Result<()>
             &plotfile,
             CompactOptions {
                 component_ids: component_ids.clone(),
+                normalizations: Vec::new(),
             },
             &mut output,
         )

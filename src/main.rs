@@ -1,6 +1,8 @@
 mod cli;
+mod colormap;
 mod convert;
 mod discovery;
+mod fulfillment;
 mod isosurface;
 mod mesh;
 mod viewer;

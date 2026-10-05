@@ -13,6 +13,9 @@ const CONFIG_FILE: &str = "teph_amrex.toml";
 
 #[derive(Debug, Default, Deserialize)]
 struct DirectoryConfig {
+    #[serde(alias = "cmap")]
+    colormap: Option<String>,
+    decimation: Option<ConfigDecimation>,
     #[serde(default)]
     isosurfaces: Vec<ConfigIsosurface>,
     #[serde(default)]
@@ -23,8 +26,12 @@ struct DirectoryConfig {
 struct ConfigIsosurface {
     quantity: String,
     value: f64,
+    color_by: Option<String>,
+    color_min: Option<f64>,
+    color_max: Option<f64>,
     #[serde(default)]
     flip: bool,
+    decimation: Option<ConfigDecimation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +45,14 @@ struct ConfigSlice {
     max: f64,
     #[serde(default)]
     flip: bool,
+    decimation: Option<ConfigDecimation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigDecimation {
+    triangles: Option<usize>,
+    percentage: Option<f64>,
 }
 
 fn default_slice_min() -> f64 {
@@ -70,7 +85,21 @@ impl IsoKey {
 #[derive(Debug, Clone)]
 pub(crate) struct IsoRequest {
     pub(crate) key: IsoKey,
+    pub(crate) color: Option<ColorRequest>,
     pub(crate) flip: bool,
+    pub(crate) decimation: Option<Decimation>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ColorRequest {
+    pub(crate) quantity: String,
+    pub(crate) range: std::ops::RangeInclusive<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Decimation {
+    Triangles(usize),
+    Percentage(f32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,10 +136,13 @@ pub(crate) struct SliceRequest {
     pub(crate) key: SliceKey,
     pub(crate) range: std::ops::RangeInclusive<f64>,
     pub(crate) flip: bool,
+    pub(crate) decimation: Option<Decimation>,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct InitialRequests {
+    pub(crate) colormap: Option<String>,
+    pub(crate) decimation: Option<Decimation>,
     pub(crate) isosurfaces: Vec<IsoRequest>,
     pub(crate) slices: Vec<SliceRequest>,
 }
@@ -140,7 +172,9 @@ pub(crate) fn parse_isosurface_command(
     };
     Ok(IsoRequest {
         key: IsoKey::new(quantity, value),
+        color: None,
         flip,
+        decimation: None,
     })
 }
 
@@ -185,6 +219,7 @@ pub(crate) fn parse_slice_command(
         key: SliceKey::new(quantity, axis, value),
         range: min..=max,
         flip,
+        decimation: None,
     })
 }
 
@@ -200,6 +235,11 @@ pub(crate) fn load_initial_requests(
         .with_context(|| format!("reading {}", config_path.display()))?;
     let config: DirectoryConfig =
         toml::from_str(&text).with_context(|| format!("parsing {}", config_path.display()))?;
+    let default_decimation = config
+        .decimation
+        .as_ref()
+        .map(parse_decimation)
+        .transpose()?;
     let isosurfaces = config
         .isosurfaces
         .into_iter()
@@ -213,9 +253,41 @@ pub(crate) fn load_initial_requests(
                 surface.value.is_finite(),
                 "configured isovalue must be finite"
             );
+            let color = match (surface.color_by, surface.color_min, surface.color_max) {
+                (None, None, None) => None,
+                (Some(quantity), Some(min), Some(max)) => {
+                    ensure!(
+                        variables.contains_key(&quantity),
+                        "configured isosurface color uses unknown quantity {:?}",
+                        quantity
+                    );
+                    ensure!(
+                        min.is_finite() && max.is_finite(),
+                        "configured isosurface color range bounds must be finite"
+                    );
+                    ensure!(
+                        max > min,
+                        "configured isosurface color maximum must exceed minimum"
+                    );
+                    Some(ColorRequest {
+                        quantity,
+                        range: min..=max,
+                    })
+                }
+                _ => {
+                    bail!("configured isosurface color requires color_by, color_min, and color_max")
+                }
+            };
             Ok(IsoRequest {
                 key: IsoKey::new(surface.quantity, surface.value),
+                color,
                 flip: surface.flip,
+                decimation: surface
+                    .decimation
+                    .as_ref()
+                    .map(parse_decimation)
+                    .transpose()?
+                    .or_else(|| default_decimation.clone()),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -244,14 +316,47 @@ pub(crate) fn load_initial_requests(
                 key: SliceKey::new(slice.quantity, parse_slice_axis(&slice.axis)?, slice.value),
                 range: slice.min..=slice.max,
                 flip: slice.flip,
+                decimation: slice
+                    .decimation
+                    .as_ref()
+                    .map(parse_decimation)
+                    .transpose()?
+                    .or_else(|| default_decimation.clone()),
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(InitialRequests {
+        colormap: config.colormap,
+        decimation: default_decimation,
         isosurfaces,
         slices,
     })
+}
+
+fn parse_decimation(config: &ConfigDecimation) -> Result<Decimation> {
+    match (config.triangles, config.percentage) {
+        (Some(triangles), None) => {
+            ensure!(triangles > 0, "decimation triangle count must be positive");
+            Ok(Decimation::Triangles(triangles))
+        }
+        (None, Some(percentage)) => {
+            ensure!(
+                percentage.is_finite() && percentage > 0.0 && percentage <= 100.0,
+                "decimation percentage must be finite and in (0, 100]"
+            );
+            let percentage = percentage as f32;
+            ensure!(
+                percentage > 0.0,
+                "decimation percentage is too small to represent"
+            );
+            Ok(Decimation::Percentage(percentage))
+        }
+        (Some(_), Some(_)) => {
+            bail!("decimation must specify either triangles or percentage, not both")
+        }
+        (None, None) => bail!("decimation must specify triangles or percentage"),
+    }
 }
 
 pub(crate) fn slice_axis_label(axis: SliceAxis) -> &'static str {
@@ -306,6 +411,118 @@ mod tests {
     #[test]
     fn rejects_unknown_quantity() {
         assert!(parse_isosurface_command("pressure 1.0", &vars()).is_err());
+    }
+
+    #[test]
+    fn parses_decimation_targets() {
+        assert_eq!(
+            parse_decimation(&ConfigDecimation {
+                triangles: Some(50_000),
+                percentage: None,
+            })
+            .unwrap(),
+            Decimation::Triangles(50_000)
+        );
+        assert_eq!(
+            parse_decimation(&ConfigDecimation {
+                triangles: None,
+                percentage: Some(12.5),
+            })
+            .unwrap(),
+            Decimation::Percentage(12.5)
+        );
+    }
+
+    #[test]
+    fn percentage_accepts_integer_config_syntax() {
+        let config: DirectoryConfig = toml::from_str("decimation = { percentage = 25 }").unwrap();
+        assert_eq!(
+            parse_decimation(config.decimation.as_ref().unwrap()).unwrap(),
+            Decimation::Percentage(25.0)
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_out_of_range_decimation() {
+        assert!(
+            parse_decimation(&ConfigDecimation {
+                triangles: Some(100),
+                percentage: Some(50.0),
+            })
+            .is_err()
+        );
+        assert!(
+            parse_decimation(&ConfigDecimation {
+                triangles: None,
+                percentage: Some(0.0),
+            })
+            .is_err()
+        );
+        assert!(
+            parse_decimation(&ConfigDecimation {
+                triangles: None,
+                percentage: Some(100.1),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn loads_colored_isosurface_config() {
+        let directory =
+            std::env::temp_dir().join(format!("teph_amrex_colored_config_{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(CONFIG_FILE),
+            r#"
+                colormap = "magma.png"
+                decimation = { percentage = 25.0 }
+
+                [[isosurfaces]]
+                quantity = "density"
+                value = 0.5
+                color_by = "temp"
+                color_min = -10.0
+                color_max = 10.0
+            "#,
+        )
+        .unwrap();
+
+        let requests = load_initial_requests(&directory, &vars()).unwrap();
+        assert_eq!(requests.colormap.as_deref(), Some("magma.png"));
+        assert_eq!(requests.decimation, Some(Decimation::Percentage(25.0)));
+        let request = &requests.isosurfaces[0];
+        assert_eq!(request.decimation, Some(Decimation::Percentage(25.0)));
+        let color = request.color.as_ref().unwrap();
+        assert_eq!(color.quantity, "temp");
+        assert_eq!(color.range, -10.0..=10.0);
+
+        fs::remove_file(directory.join(CONFIG_FILE)).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_incomplete_isosurface_color_config() {
+        let directory = std::env::temp_dir().join(format!(
+            "teph_amrex_incomplete_color_config_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(CONFIG_FILE),
+            r#"
+                [[isosurfaces]]
+                quantity = "density"
+                value = 0.5
+                color_by = "temp"
+            "#,
+        )
+        .unwrap();
+
+        assert!(load_initial_requests(&directory, &vars()).is_err());
+
+        fs::remove_file(directory.join(CONFIG_FILE)).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]

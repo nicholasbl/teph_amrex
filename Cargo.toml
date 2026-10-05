@@ -5,10 +5,13 @@ edition = "2024"
 
 [dependencies]
 tephrite_rs = { git = "https://github.com/InsightCenterNoodles/tephrite_rs.git", rev = "8937c9fc07e58efd65e1704001c1b2b215abc40f" }
-amrex_rs = { git = "https://github.com/nicholasbl/amrex_rs", rev = "ec6e6b3f4dcac9d7532570c5f9b351d2309e934d" }
+amrex_rs = { git = "https://github.com/nicholasbl/amrex_rs.git", rev = "7d8f7292f0c14c37e2de0faaa564cf1da410d8c6" }
 bevy = "0.18.1"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
+crossbeam-queue = "0.3"
+memmap2 = "0.9"
+mini-moka = "0.10"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 

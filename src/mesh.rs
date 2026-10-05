@@ -5,8 +5,12 @@ use bevy::{
     prelude::*,
 };
 
-pub(crate) fn mesh3d_to_bevy_mesh(mesh: Mesh3D) -> Mesh {
+pub(crate) fn mesh3d_to_bevy_mesh(mesh: Mesh3D) -> (Mesh, u64) {
     let vertex_count = mesh.positions.len();
+    let estimated_bytes = mesh.positions.len() * std::mem::size_of::<[f32; 3]>()
+        + mesh.positions.len() * std::mem::size_of::<[f32; 3]>()
+        + mesh.uv.len() * std::mem::size_of::<[f32; 2]>()
+        + mesh.indices.len() * std::mem::size_of::<[u32; 3]>();
     let positions = mesh.positions;
     let uv = mesh.uv;
     let normals = equal_weighted_vertex_normals(&positions, &mesh.indices);
@@ -31,9 +35,10 @@ pub(crate) fn mesh3d_to_bevy_mesh(mesh: Mesh3D) -> Mesh {
         );
     }
 
-    mesh
+    (mesh, estimated_bytes as u64)
 }
 
+// We use our own as bevy's normal compute does WEIRD things.
 fn equal_weighted_vertex_normals(positions: &[[f32; 3]], faces: &[[u32; 3]]) -> Vec<[f32; 3]> {
     let mut normals = vec![Vec3::ZERO; positions.len()];
     for &[a, b, c] in faces {
@@ -57,4 +62,20 @@ fn equal_weighted_vertex_normals(positions: &[[f32; 3]], faces: &[[u32; 3]]) -> 
         .into_iter()
         .map(|normal| normal.try_normalize().unwrap_or(Vec3::ZERO).to_array())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reversing_face_winding_reverses_generated_normals() {
+        let positions = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+
+        let regular = equal_weighted_vertex_normals(&positions, &[[0, 1, 2]]);
+        let flipped = equal_weighted_vertex_normals(&positions, &[[0, 2, 1]]);
+
+        assert_eq!(regular, vec![[0.0, 0.0, 1.0]; 3]);
+        assert_eq!(flipped, vec![[0.0, 0.0, -1.0]; 3]);
+    }
 }
