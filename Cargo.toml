@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tephrite_rs = { git = "https://github.com/InsightCenterNoodles/tephrite_rs.git", rev = "8937c9fc07e58efd65e1704001c1b2b215abc40f" }
-amrex_rs = { git = "https://github.com/nicholasbl/amrex_rs.git", rev = "7d8f7292f0c14c37e2de0faaa564cf1da410d8c6" }
-bevy = "0.18.1"
+tephrite_rs = { git = "https://github.com/InsightCenterNoodles/tephrite_rs.git", rev = "2de4d12109af827aab2d59319960efbd972c9efe" }
+amrex_rs = { git = "https://github.com/nicholasbl/amrex_rs.git", rev = "62b0fc53b370b432eb68bec97d2329be5bd9423c" }
+bevy = "0.19"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
 crossbeam-queue = "0.3"

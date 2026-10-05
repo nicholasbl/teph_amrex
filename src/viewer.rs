@@ -78,6 +78,9 @@ struct ViewerState {
     loading_indicator: Entity,
 }
 
+#[derive(Debug, Resource)]
+struct AppRoot(Entity);
+
 #[derive(Debug, Component)]
 struct AddIsosurfaceControl;
 
@@ -117,6 +120,8 @@ impl Plugin for AmrexViewerPlugin {
     }
 }
 
+impl TephriteApp for AmrexViewerPlugin {}
+
 #[derive(Debug, Resource)]
 struct AppDirectory(PathBuf);
 
@@ -129,6 +134,10 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut server: ResMut<AssetServer>,
 ) {
+    let root_id = commands.spawn((Transform::default(), NavigatorMarker)).id();
+
+    commands.insert_resource(AppRoot(root_id));
+
     if let Err(err) = setup_inner(
         &mut commands,
         &dir,
@@ -137,6 +146,7 @@ fn setup(
         &mut images,
         &mut meshes,
         &mut server,
+        root_id,
     ) {
         error!("unable to set up AMReX viewer: {err:?}");
     }
@@ -150,6 +160,7 @@ fn setup_inner(
     images: &mut Assets<Image>,
     meshes: &mut Assets<Mesh>,
     server: &mut AssetServer,
+    root: Entity,
 ) -> Result<()> {
     let timestep_infos = discover_archive_timesteps(&dir.0)?;
     ensure!(
@@ -203,9 +214,8 @@ fn setup_inner(
             LoadingIndicator,
             Mesh3d(loading_mesh),
             MeshMaterial3d(loading_material),
-            Transform::from_xyz(-1.0, 2.0, 0.0),
+            Transform::from_xyz(-0.75, 1.5, 0.0),
             Visibility::Hidden,
-            Replicated,
         ))
         .id();
 
@@ -246,7 +256,7 @@ fn setup_inner(
     for request in requests.slices {
         replace_slice_request(commands, defs, &mut state, request);
     }
-    request_fulfillment(commands, &mut state);
+    request_fulfillment(commands, &mut state, root);
 
     commands.insert_resource(state);
     Ok(())
@@ -430,22 +440,20 @@ fn timestep_label(index: usize, info: &TimestepInfo) -> String {
 fn setup_scene_basics(commands: &mut Commands, server: &AssetServer) {
     commands.spawn((
         DirectionalLight {
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             illuminance: 50000.0,
             ..default()
         },
         Transform::from_xyz(4.0, 6.0, 3.0).looking_at(Vec3::ZERO, Dir3::Y),
-        Replicated,
     ));
 
     commands.spawn((
         DirectionalLight {
-            shadows_enabled: true,
+            shadow_maps_enabled: true,
             illuminance: 50000.0,
             ..default()
         },
         Transform::from_xyz(4.0, -6.0, 3.0).looking_at(Vec3::ZERO, Dir3::Y),
-        Replicated,
     ));
 
     commands.insert_resource(EnvironmentLighting {
@@ -454,8 +462,6 @@ fn setup_scene_basics(commands: &mut Commands, server: &AssetServer) {
         intensity: 5000.0,
         skybox_color: Color::srgb(0.5, 0.5, 1.0).into(),
     });
-
-    commands.spawn((Transform::default(), Replicated, NavigatorMarker));
 }
 
 fn on_add_isosurface(
@@ -464,6 +470,7 @@ fn on_add_isosurface(
     mut defs: ResMut<tephrite_rs::remote_control::prelude::RemoteControlDefinitions>,
     mut state: ResMut<ViewerState>,
     controls: Query<(), With<AddIsosurfaceControl>>,
+    root: Res<AppRoot>,
 ) {
     if trigger.event().aspect_id != ADD_ISOSURFACE_ASPECT || !controls.contains(trigger.entity) {
         return;
@@ -476,7 +483,7 @@ fn on_add_isosurface(
         Ok(mut request) => {
             request.decimation = state.default_decimation.clone();
             replace_isosurface_request(&mut commands, &mut defs, &mut state, request);
-            request_fulfillment(&mut commands, &mut state);
+            request_fulfillment(&mut commands, &mut state, root.0);
         }
         Err(err) => error!("invalid isosurface request {text:?}: {err:?}"),
     }
@@ -488,6 +495,7 @@ fn on_add_slice(
     mut defs: ResMut<tephrite_rs::remote_control::prelude::RemoteControlDefinitions>,
     mut state: ResMut<ViewerState>,
     controls: Query<(), With<AddSliceControl>>,
+    root: Res<AppRoot>,
 ) {
     if trigger.event().aspect_id != ADD_SLICE_ASPECT || !controls.contains(trigger.entity) {
         return;
@@ -500,7 +508,7 @@ fn on_add_slice(
         Ok(mut request) => {
             request.decimation = state.default_decimation.clone();
             replace_slice_request(&mut commands, &mut defs, &mut state, request);
-            request_fulfillment(&mut commands, &mut state);
+            request_fulfillment(&mut commands, &mut state, root.0);
         }
         Err(err) => error!("invalid slice request {text:?}: {err:?}"),
     }
@@ -512,6 +520,7 @@ fn on_delete_isosurface(
     mut defs: ResMut<tephrite_rs::remote_control::prelude::RemoteControlDefinitions>,
     mut state: ResMut<ViewerState>,
     controls: Query<&DeleteIsosurfaceControl>,
+    root: Res<AppRoot>,
 ) {
     if trigger.event().aspect_id != DELETE_ISOSURFACE_ASPECT {
         return;
@@ -524,7 +533,7 @@ fn on_delete_isosurface(
     };
     let key = control.key.clone();
     remove_isosurface_request(&mut commands, &mut defs, &mut state, &key);
-    request_fulfillment(&mut commands, &mut state);
+    request_fulfillment(&mut commands, &mut state, root.0);
 }
 
 fn on_delete_slice(
@@ -533,6 +542,7 @@ fn on_delete_slice(
     mut defs: ResMut<tephrite_rs::remote_control::prelude::RemoteControlDefinitions>,
     mut state: ResMut<ViewerState>,
     controls: Query<&DeleteSliceControl>,
+    root: Res<AppRoot>,
 ) {
     if trigger.event().aspect_id != DELETE_SLICE_ASPECT {
         return;
@@ -545,7 +555,7 @@ fn on_delete_slice(
     };
     let key = control.key.clone();
     remove_slice_request(&mut commands, &mut defs, &mut state, &key);
-    request_fulfillment(&mut commands, &mut state);
+    request_fulfillment(&mut commands, &mut state, root.0);
 }
 
 fn on_set_timestep(
@@ -553,6 +563,7 @@ fn on_set_timestep(
     mut commands: Commands,
     mut state: ResMut<ViewerState>,
     controls: Query<(), With<TimestepControl>>,
+    root: Res<AppRoot>,
 ) {
     if trigger.event().aspect_id != TIMESTEP_ASPECT || !controls.contains(trigger.entity) {
         return;
@@ -569,7 +580,7 @@ fn on_set_timestep(
         error!("invalid timestep selection {choice:?}");
         return;
     };
-    select_timestep(&mut commands, &mut state, index);
+    select_timestep(&mut commands, &mut state, index, root.0);
 }
 
 fn on_set_colormap(
@@ -593,11 +604,14 @@ fn on_set_colormap(
         return;
     };
     let image = state.colormaps[index].image.clone();
-    let Some(material) = materials.get_mut(&state.colored_isosurface_material) else {
+
+    let Some(mut material) = materials.get_mut(&state.colored_isosurface_material) else {
         error!("colored isosurface material is unavailable");
         return;
     };
+
     material.base_color_texture = Some(image);
+
     state.current_colormap = index;
     info!("using colormap {choice:?}");
 }
@@ -606,10 +620,11 @@ fn on_interactor_step(
     trigger: On<GlobalInteractorAction>,
     mut commands: Commands,
     mut state: ResMut<ViewerState>,
+    root: Res<AppRoot>,
 ) {
     if !matches!(
         trigger.action,
-        InteractorAction::Previous | InteractorAction::Next
+        InteractorActionEventKind::Pressed(InteractorAction::Previous | InteractorAction::Next)
     ) {
         return;
     }
@@ -618,17 +633,19 @@ fn on_interactor_step(
     }
 
     let next = match trigger.action {
-        InteractorAction::Previous => {
+        InteractorActionEventKind::Pressed(InteractorAction::Previous) => {
             (state.current + state.timesteps.len() - 1) % state.timesteps.len()
         }
-        InteractorAction::Next => (state.current + 1) % state.timesteps.len(),
+        InteractorActionEventKind::Pressed(InteractorAction::Next) => {
+            (state.current + 1) % state.timesteps.len()
+        }
         _ => state.current,
     };
 
-    select_timestep(&mut commands, &mut state, next);
+    select_timestep(&mut commands, &mut state, next, root.0);
 }
 
-fn select_timestep(commands: &mut Commands, state: &mut ViewerState, next: usize) {
+fn select_timestep(commands: &mut Commands, state: &mut ViewerState, next: usize, root: Entity) {
     if next >= state.timesteps.len() {
         error!("timestep {next} is out of range");
         return;
@@ -641,7 +658,7 @@ fn select_timestep(commands: &mut Commands, state: &mut ViewerState, next: usize
         "requested timestep {} ({})",
         state.current, state.timesteps[state.current].name
     );
-    request_fulfillment(commands, state);
+    request_fulfillment(commands, state, root);
 }
 
 fn replace_isosurface_request(
@@ -744,7 +761,7 @@ fn remove_slice_request(
     }
 }
 
-fn request_fulfillment(commands: &mut Commands, state: &mut ViewerState) {
+fn request_fulfillment(commands: &mut Commands, state: &mut ViewerState, root: Entity) {
     let Some(archive_path) = state
         .timesteps
         .get(state.current)
@@ -779,7 +796,7 @@ fn request_fulfillment(commands: &mut Commands, state: &mut ViewerState) {
     });
 
     if complete {
-        commit_pending(commands, state);
+        commit_pending(commands, state, root);
     } else {
         commands
             .entity(state.loading_indicator)
@@ -815,6 +832,7 @@ fn poll_fulfillment_results(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut state: ResMut<ViewerState>,
+    root: Res<AppRoot>,
 ) {
     while let Some(result) = state.fulfillment.pop_result() {
         match result {
@@ -823,6 +841,8 @@ fn poll_fulfillment_results(
                 mesh,
                 estimated_bytes,
             } => {
+                info!("Geometry ready {}", mesh.count_vertices());
+
                 let cached = CachedMesh {
                     handle: meshes.add(mesh),
                     estimated_bytes,
@@ -835,6 +855,7 @@ fn poll_fulfillment_results(
                 }
             }
             FulfillmentResult::Complete { generation } => {
+                info!("Request complete {generation}");
                 if let Some(pending) = state.pending.as_mut()
                     && pending.generation == generation
                 {
@@ -868,14 +889,18 @@ fn poll_fulfillment_results(
                 .all(|key| pending.meshes.contains_key(key))
     });
     if ready {
-        commit_pending(&mut commands, &mut state);
+        commit_pending(&mut commands, &mut state, root.0);
     }
 }
 
-fn commit_pending(commands: &mut Commands, state: &mut ViewerState) {
+fn commit_pending(commands: &mut Commands, state: &mut ViewerState, root: Entity) {
+    info!("Commit pending");
+
     let Some(pending) = state.pending.take() else {
+        info!("break 1");
         return;
     };
+
     if !pending.complete
         || !pending
             .required
@@ -883,6 +908,7 @@ fn commit_pending(commands: &mut Commands, state: &mut ViewerState) {
             .all(|key| pending.meshes.contains_key(key))
     {
         state.pending = Some(pending);
+        info!("break 2");
         return;
     }
 
@@ -899,6 +925,9 @@ fn commit_pending(commands: &mut Commands, state: &mut ViewerState) {
         } else {
             state.isosurface_material.clone()
         };
+
+        info!("Spawning new mesh...");
+
         entities.push(
             commands
                 .spawn((
@@ -906,18 +935,22 @@ fn commit_pending(commands: &mut Commands, state: &mut ViewerState) {
                     MeshMaterial3d(material),
                     state.geometry_transform,
                     Visibility::Visible,
-                    Replicated,
+                    ChildOf(root),
                 ))
                 .id(),
         );
     }
+
     for entity in state.visible_entities.drain(..) {
         commands.entity(entity).despawn();
     }
+
     state.visible_entities = entities;
+
     commands
         .entity(state.loading_indicator)
         .insert(Visibility::Hidden);
+
     info!(
         "showing fulfilled timestep {} ({})",
         state.current, state.timesteps[state.current].name

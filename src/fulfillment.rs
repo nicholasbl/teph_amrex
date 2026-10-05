@@ -13,7 +13,7 @@ use amrex_rs::{
     read_compact_selected_unchecked, slice_compact,
 };
 use anyhow::{Context, Result};
-use bevy::prelude::Mesh;
+use bevy::{log::info, prelude::Mesh};
 use crossbeam_queue::ArrayQueue;
 use memmap2::Mmap;
 use mini_moka::sync::Cache;
@@ -330,6 +330,7 @@ fn build_geometry(
     variables: &HashMap<String, u32>,
     job: &GeometryJob,
 ) -> Result<amrex_rs::Mesh3D> {
+    info!("Building geometry");
     let (mut mesh, decimation) = match &job.request {
         GeometryRequest::Isosurface(request) => {
             let surface_id = component_id(variables, &request.key.quantity)?;
@@ -366,9 +367,15 @@ fn build_geometry(
             )
         }
     };
+
     if let Some(decimation) = decimation {
+        info!("Decimating mesh before: {}", mesh.positions.len());
         decimate_geometry(&mut mesh, decimation)?;
+        info!("Decimating mesh after: {}", mesh.positions.len());
     }
+
+    info!("Built mesh, size {}", mesh.positions.len());
+
     Ok(mesh)
 }
 

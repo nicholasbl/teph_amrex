@@ -233,6 +233,7 @@ pub(crate) fn load_initial_requests(
     }
     let text = fs::read_to_string(&config_path)
         .with_context(|| format!("reading {}", config_path.display()))?;
+
     let config: DirectoryConfig =
         toml::from_str(&text).with_context(|| format!("parsing {}", config_path.display()))?;
     let default_decimation = config
@@ -240,6 +241,7 @@ pub(crate) fn load_initial_requests(
         .as_ref()
         .map(parse_decimation)
         .transpose()?;
+
     let isosurfaces = config
         .isosurfaces
         .into_iter()
