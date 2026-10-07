@@ -1,12 +1,14 @@
 use std::{collections::HashMap, path::PathBuf};
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use bevy::{
     asset::RenderAssetUsages,
     image::{ImageSampler, ImageSamplerDescriptor},
+    light::{NotShadowCaster, NotShadowReceiver},
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
+use bevy_fontmesh::{FontMeshPlugin, TextMesh, TextMeshStyle};
 use mini_moka::sync::Cache;
 use tephrite_rs::{prelude::*, remote_control::common::PropertyValue};
 
@@ -31,13 +33,14 @@ const ADD_SLICE_ASPECT: u32 = 0;
 const DELETE_SLICE_ASPECT: u32 = 0;
 const TIMESTEP_ASPECT: u32 = 0;
 const COLORMAP_ASPECT: u32 = 0;
+const SLICE_COLORMAP_ASPECT: u32 = 0;
 
 const MESH_CACHE_CAPACITY_MIB: u64 = 2 * 1024;
 const MIB: u64 = 1024 * 1024;
 
 #[derive(Clone)]
 struct CachedMesh {
-    handle: Handle<Mesh>,
+    handle: Option<Handle<Mesh>>,
     estimated_bytes: u64,
 }
 
@@ -66,9 +69,12 @@ struct ViewerState {
     isosurface_material: Handle<StandardMaterial>,
     colored_isosurface_material: Handle<StandardMaterial>,
     colormaps: Vec<ColorMapChoice>,
+    slice_colormap_indices: HashMap<String, usize>,
     current_colormap: usize,
+    current_slice_colormap: usize,
     default_decimation: Option<Decimation>,
     slice_material: Handle<StandardMaterial>,
+    slice_override_materials: Vec<Handle<StandardMaterial>>,
     geometry_transform: Transform,
     generation: u64,
     visible_entities: Vec<Entity>,
@@ -76,6 +82,8 @@ struct ViewerState {
     mesh_cache: Cache<GeometryKey, CachedMesh>,
     fulfillment: FulfillmentWorker,
     loading_indicator: Entity,
+    timestep_text: Entity,
+    timestep_font: Handle<Font>,
 }
 
 #[derive(Debug, Resource)]
@@ -104,18 +112,33 @@ struct TimestepControl;
 struct ColorMapControl;
 
 #[derive(Debug, Component)]
+struct SliceColorMapControl;
+
+#[derive(Debug, Component)]
 struct LoadingIndicator;
 
-pub(crate) struct AmrexViewerPlugin {
-    pub(crate) dir: Option<PathBuf>,
-}
+#[derive(Debug, Component)]
+struct TimestepText;
+
+pub(crate) struct AmrexViewerPlugin;
 
 impl Plugin for AmrexViewerPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(AppDirectory(self.dir.as_ref().cloned().unwrap_or_default()))
+        use clap::Parser;
+
+        let args = match crate::cli::Args::try_parse() {
+            Ok(x) => x,
+            Err(e) => {
+                error!("Unable to parse args: {e}");
+                return;
+            }
+        };
+
+        app.insert_resource(AppDirectory(args.dir))
             .add_systems(Startup, setup)
             .add_systems(Update, (poll_fulfillment_results, spin_loading_indicator))
             .add_observer(on_interactor_step)
+            .add_plugins(FontMeshPlugin::<StandardMaterial>::default())
             .add_plugins(NavigationPlugin::new(NavigatorMode::ObjectCentric));
     }
 }
@@ -171,7 +194,22 @@ fn setup_inner(
     let variables = variables_from_compact(&timestep_infos[0].archive_path)?;
     let geometry_transform = fit_domain_transform(timestep_infos[0].domain)?;
     let requests = load_initial_requests(&dir.0, &variables)?;
-    let (colormaps, current_colormap) = load_colormaps(requests.colormap.as_deref(), images)?;
+    let requested_slice_colormaps = requests
+        .slices
+        .iter()
+        .filter_map(|request| request.colormap.clone())
+        .chain(requests.slice_colormap.iter().cloned())
+        .collect::<Vec<_>>();
+    let (colormaps, current_colormap, slice_colormap_indices) = load_colormaps(
+        requests.colormap.as_deref(),
+        &requested_slice_colormaps,
+        images,
+    )?;
+    let current_slice_colormap = requests
+        .slice_colormap
+        .as_ref()
+        .and_then(|name| slice_colormap_indices.get(name).copied())
+        .unwrap_or(current_colormap);
     info!(
         "fitting archive domain {:?} with geometry transform {:?}",
         timestep_infos[0].domain, geometry_transform
@@ -194,14 +232,30 @@ fn setup_inner(
         ..Default::default()
     });
     let slice_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 0.74, 0.22, 0.72),
+        //base_color: Color::srgba(1.0, 1.0, 1.0, 0.72),
+        base_color_texture: Some(colormaps[current_slice_colormap].image.clone()),
         perceptual_roughness: 0.65,
         metallic: 0.0,
-        alpha_mode: AlphaMode::Blend,
+        //alpha_mode: AlphaMode::Blend,
         cull_mode: None,
         double_sided: true,
         ..Default::default()
     });
+    let slice_override_materials = colormaps
+        .iter()
+        .map(|colormap| {
+            materials.add(StandardMaterial {
+                //base_color: Color::srgba(1.0, 1.0, 1.0, 0.72),
+                base_color_texture: Some(colormap.image.clone()),
+                perceptual_roughness: 0.65,
+                metallic: 0.0,
+                //alpha_mode: AlphaMode::Blend,
+                cull_mode: None,
+                double_sided: true,
+                ..Default::default()
+            })
+        })
+        .collect();
     let loading_mesh = meshes.add(Cuboid::new(0.16, 0.16, 0.16));
     let loading_material = materials.add(StandardMaterial {
         base_color: Color::srgb(1.0, 0.35, 0.05),
@@ -216,6 +270,35 @@ fn setup_inner(
             MeshMaterial3d(loading_material),
             Transform::from_xyz(-0.75, 1.5, 0.0),
             Visibility::Hidden,
+        ))
+        .id();
+    let timestep_font = Handle::<Font>::default();
+    let timestep_text = commands
+        .spawn((
+            Name::new("Committed Timestep"),
+            TimestepText,
+            TextMesh {
+                text: committed_timestep_text(timestep_infos[0].simulation_time),
+                font: timestep_font.clone(),
+                style: TextMeshStyle {
+                    depth: 0.01,
+                    subdivision: 12,
+                    anchor: bevy_fontmesh::TextAnchor::Center,
+                    ..default()
+                },
+            },
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::WHITE,
+                emissive: LinearRgba::WHITE,
+                unlit: true,
+                cull_mode: None,
+                double_sided: true,
+                ..default()
+            })),
+            Transform::from_xyz(0.0, 1.5, 0.0).with_scale(Vec3::splat(0.25)),
+            Visibility::Hidden,
+            NotShadowCaster,
+            NotShadowReceiver,
         ))
         .id();
 
@@ -235,9 +318,12 @@ fn setup_inner(
         isosurface_material,
         colored_isosurface_material,
         colormaps,
+        slice_colormap_indices,
         current_colormap,
+        current_slice_colormap,
         default_decimation: requests.decimation.clone(),
         slice_material,
+        slice_override_materials,
         geometry_transform,
         generation: 0,
         visible_entities: Vec::new(),
@@ -245,6 +331,8 @@ fn setup_inner(
         mesh_cache,
         fulfillment,
         loading_indicator,
+        timestep_text,
+        timestep_font,
     };
 
     setup_remote_controls(commands, defs, &state);
@@ -329,8 +417,9 @@ fn color_ramp_image() -> Image {
 
 fn load_colormaps(
     requested: Option<&str>,
+    requested_slice_colormaps: &[String],
     images: &mut Assets<Image>,
-) -> Result<(Vec<ColorMapChoice>, usize)> {
+) -> Result<(Vec<ColorMapChoice>, usize, HashMap<String, usize>)> {
     let builtins = discover_builtin_colormaps(std::path::Path::new(BUILTIN_COLORMAP_DIR))?;
     let selection = select_colormap(requested, &builtins)?;
     let mut choices = builtins
@@ -343,6 +432,7 @@ fn load_colormaps(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let mut external_indices = HashMap::new();
     let selected = match selection {
         ColorMapSelection::Builtin(index) => index,
         ColorMapSelection::External(path) => {
@@ -351,6 +441,7 @@ fn load_colormaps(
                 label: format!("Custom: {}", path.display()),
                 image: images.add(load_colormap_image(&path)?),
             });
+            external_indices.insert(path, index);
             index
         }
         ColorMapSelection::Fallback => {
@@ -361,7 +452,30 @@ fn load_colormaps(
             0
         }
     };
-    Ok((choices, selected))
+
+    let mut slice_indices = HashMap::new();
+    for requested in requested_slice_colormaps {
+        let index = match select_colormap(Some(requested), &builtins)? {
+            ColorMapSelection::Builtin(index) => index,
+            ColorMapSelection::External(path) => {
+                if let Some(index) = external_indices.get(&path) {
+                    *index
+                } else {
+                    let index = choices.len();
+                    choices.push(ColorMapChoice {
+                        label: format!("Custom: {}", path.display()),
+                        image: images.add(load_colormap_image(&path)?),
+                    });
+                    external_indices.insert(path, index);
+                    index
+                }
+            }
+            ColorMapSelection::Fallback => unreachable!("an explicit colormap cannot fall back"),
+        };
+        slice_indices.insert(requested.clone(), index);
+    }
+
+    Ok((choices, selected, slice_indices))
 }
 
 fn setup_remote_controls(
@@ -406,6 +520,26 @@ fn setup_remote_controls(
         },
     });
 
+    let slice_colormap_entity = commands
+        .spawn((Name::new("Slice Colormap"), SliceColorMapControl))
+        .id();
+    commands
+        .entity(slice_colormap_entity)
+        .observe(on_set_slice_colormap);
+    defs.push(tephrite_rs::remote_control::prelude::PropertyDefinition {
+        id: slice_colormap_entity,
+        aspect_id: SLICE_COLORMAP_ASPECT,
+        label: "Slice Colormap".into(),
+        control: tephrite_rs::remote_control::prelude::PropertyControl::Select {
+            options: state
+                .colormaps
+                .iter()
+                .map(|colormap| colormap.label.clone())
+                .collect(),
+            initial: state.current_slice_colormap,
+        },
+    });
+
     let add_entity = commands
         .spawn((Name::new("Add Isosurface"), AddIsosurfaceControl))
         .id();
@@ -435,6 +569,10 @@ fn setup_remote_controls(
 
 fn timestep_label(index: usize, info: &TimestepInfo) -> String {
     format!("{index}: {} (t={:.6e})", info.name, info.simulation_time)
+}
+
+fn committed_timestep_text(simulation_time: f64) -> String {
+    format!("t = {simulation_time:.6e}")
 }
 
 fn setup_scene_basics(commands: &mut Commands, server: &AssetServer) {
@@ -609,11 +747,41 @@ fn on_set_colormap(
         error!("colored isosurface material is unavailable");
         return;
     };
-
     material.base_color_texture = Some(image);
 
     state.current_colormap = index;
-    info!("using colormap {choice:?}");
+    info!("using isosurface colormap {choice:?}");
+}
+
+fn on_set_slice_colormap(
+    trigger: On<tephrite_rs::remote_control::prelude::RemoteControlEvent>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut state: ResMut<ViewerState>,
+    controls: Query<(), With<SliceColorMapControl>>,
+) {
+    if trigger.event().aspect_id != SLICE_COLORMAP_ASPECT || !controls.contains(trigger.entity) {
+        return;
+    }
+    let PropertyValue::Choice(choice) = &trigger.event().value else {
+        return;
+    };
+    let Some(index) = state
+        .colormaps
+        .iter()
+        .position(|colormap| colormap.label == *choice)
+    else {
+        error!("invalid slice colormap selection {choice:?}");
+        return;
+    };
+    let image = state.colormaps[index].image.clone();
+    let Some(mut material) = materials.get_mut(&state.slice_material) else {
+        error!("slice material is unavailable");
+        return;
+    };
+    material.base_color_texture = Some(image);
+
+    state.current_slice_colormap = index;
+    info!("using slice colormap {choice:?}");
 }
 
 fn on_interactor_step(
@@ -841,10 +1009,14 @@ fn poll_fulfillment_results(
                 mesh,
                 estimated_bytes,
             } => {
-                info!("Geometry ready {}", mesh.count_vertices());
+                if let Some(mesh) = mesh.as_ref() {
+                    info!("Geometry ready {}", mesh.count_vertices());
+                } else {
+                    info!("Geometry ready with no triangles; skipping render asset");
+                }
 
                 let cached = CachedMesh {
-                    handle: meshes.add(mesh),
+                    handle: mesh.map(|mesh| meshes.add(mesh)),
                     estimated_bytes,
                 };
                 state.mesh_cache.insert(key.clone(), cached.clone());
@@ -918,8 +1090,11 @@ fn commit_pending(commands: &mut Commands, state: &mut ViewerState, root: Entity
             .meshes
             .get(&key)
             .expect("required mesh checked above");
+        let Some(handle) = cached.handle.as_ref() else {
+            continue;
+        };
         let material = if key.is_slice() {
-            state.slice_material.clone()
+            slice_material_for_key(state, &key)
         } else if key.is_colored_isosurface() {
             state.colored_isosurface_material.clone()
         } else {
@@ -928,17 +1103,23 @@ fn commit_pending(commands: &mut Commands, state: &mut ViewerState, root: Entity
 
         info!("Spawning new mesh...");
 
-        entities.push(
+        let new = commands
+            .spawn((
+                Mesh3d(handle.clone()),
+                MeshMaterial3d(material),
+                state.geometry_transform,
+                Visibility::Visible,
+                ChildOf(root),
+            ))
+            .id();
+
+        if key.is_slice() {
             commands
-                .spawn((
-                    Mesh3d(cached.handle.clone()),
-                    MeshMaterial3d(material),
-                    state.geometry_transform,
-                    Visibility::Visible,
-                    ChildOf(root),
-                ))
-                .id(),
-        );
+                .entity(new)
+                .insert((NotShadowCaster, NotShadowReceiver));
+        }
+
+        entities.push(new);
     }
 
     for entity in state.visible_entities.drain(..) {
@@ -946,6 +1127,20 @@ fn commit_pending(commands: &mut Commands, state: &mut ViewerState, root: Entity
     }
 
     state.visible_entities = entities;
+
+    commands.entity(state.timestep_text).insert((
+        TextMesh {
+            text: committed_timestep_text(state.timesteps[state.current].simulation_time),
+            font: state.timestep_font.clone(),
+            style: TextMeshStyle {
+                depth: 0.01,
+                subdivision: 12,
+                anchor: bevy_fontmesh::TextAnchor::Center,
+                ..default()
+            },
+        },
+        Visibility::Visible,
+    ));
 
     commands
         .entity(state.loading_indicator)
@@ -955,6 +1150,19 @@ fn commit_pending(commands: &mut Commands, state: &mut ViewerState, root: Entity
         "showing fulfilled timestep {} ({})",
         state.current, state.timesteps[state.current].name
     );
+}
+
+fn slice_material_for_key(state: &ViewerState, key: &GeometryKey) -> Handle<StandardMaterial> {
+    let archive_path = &state.timesteps[state.current].archive_path;
+    let colormap = state
+        .slice_requests
+        .iter()
+        .find(|request| GeometryJob::slice(archive_path, request).key == *key)
+        .and_then(|request| request.colormap.as_ref());
+    let Some(index) = colormap.and_then(|name| state.slice_colormap_indices.get(name)) else {
+        return state.slice_material.clone();
+    };
+    state.slice_override_materials[*index].clone()
 }
 
 fn spin_loading_indicator(
@@ -996,6 +1204,11 @@ mod tests {
             timestep_label(2, &info),
             "2: plt00005.compact (t=1.250000e-6)"
         );
+    }
+
+    #[test]
+    fn committed_timestep_uses_scientific_notation() {
+        assert_eq!(committed_timestep_text(1.25e-6), "t = 1.250000e-6");
     }
 
     #[test]

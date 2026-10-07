@@ -5,7 +5,7 @@ use bevy::{
     prelude::*,
 };
 
-pub(crate) fn mesh3d_to_bevy_mesh(mesh: Mesh3D) -> (Mesh, u64) {
+pub(crate) fn mesh3d_to_bevy_mesh(mesh: Mesh3D) -> (Option<Mesh>, u64) {
     let vertex_count = mesh.positions.len();
     let estimated_bytes = mesh.positions.len() * std::mem::size_of::<[f32; 3]>()
         + mesh.positions.len() * std::mem::size_of::<[f32; 3]>()
@@ -16,6 +16,13 @@ pub(crate) fn mesh3d_to_bevy_mesh(mesh: Mesh3D) -> (Mesh, u64) {
     let normals = equal_weighted_vertex_normals(&positions, &mesh.indices);
 
     let indices = mesh.indices.into_boxed_slice().as_flattened().to_vec();
+
+    // Bevy 0.19's mesh allocator emits a misleading slab use-after-free error
+    // for empty meshes. Empty extraction results are valid (for example, an
+    // isovalue absent from a timestep), but they must not become render assets.
+    if positions.is_empty() || indices.is_empty() {
+        return (None, estimated_bytes as u64);
+    }
 
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
@@ -35,7 +42,7 @@ pub(crate) fn mesh3d_to_bevy_mesh(mesh: Mesh3D) -> (Mesh, u64) {
         );
     }
 
-    (mesh, estimated_bytes as u64)
+    (Some(mesh), estimated_bytes as u64)
 }
 
 // We use our own as bevy's normal compute does WEIRD things.
@@ -77,5 +84,24 @@ mod tests {
 
         assert_eq!(regular, vec![[0.0, 0.0, 1.0]; 3]);
         assert_eq!(flipped, vec![[0.0, 0.0, -1.0]; 3]);
+    }
+
+    #[test]
+    fn empty_geometry_does_not_create_a_bevy_mesh() {
+        let (mesh, estimated_bytes) = mesh3d_to_bevy_mesh(Mesh3D::default());
+
+        assert!(mesh.is_none());
+        assert_eq!(estimated_bytes, 0);
+    }
+
+    #[test]
+    fn geometry_without_faces_does_not_create_a_bevy_mesh() {
+        let (mesh, _) = mesh3d_to_bevy_mesh(Mesh3D {
+            positions: vec![[0.0, 0.0, 0.0]],
+            uv: vec![[0.0, 0.0]],
+            indices: Vec::new(),
+        });
+
+        assert!(mesh.is_none());
     }
 }

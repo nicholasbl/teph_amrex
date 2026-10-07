@@ -10,7 +10,7 @@ use std::{
 use amrex_rs::{
     DecimateOptions, DecimatePipelineOptions, DecimateTarget, IsosurfaceOptions, Sample,
     SliceOptions, SlicePlane, Surface, decimate_mesh_pipeline, isosurface_compact,
-    read_compact_selected_unchecked, slice_compact,
+    read_compact_selected, slice_compact,
 };
 use anyhow::{Context, Result};
 use bevy::{log::info, prelude::Mesh};
@@ -161,7 +161,7 @@ pub(crate) struct FulfillmentRequest {
 pub(crate) enum FulfillmentResult {
     GeometryReady {
         key: GeometryKey,
-        mesh: Mesh,
+        mesh: Option<Mesh>,
         estimated_bytes: u64,
     },
     Complete {
@@ -266,7 +266,7 @@ fn fulfill_request(
 
         // SAFETY: Compact archives are treated as immutable for the viewer's
         // lifetime and were produced by the matching amrex_rs archive format.
-        let compact = unsafe { read_compact_selected_unchecked(&mapping, &selected) }
+        let compact = read_compact_selected(&mapping, &selected)
             .with_context(|| format!("selectively decoding {}", request.archive_path.display()))?;
 
         for job in &request.jobs {
@@ -391,12 +391,39 @@ fn decimate_geometry(mesh: &mut amrex_rs::Mesh3D, decimation: &Decimation) -> Re
             ..DecimatePipelineOptions::default()
         },
     )?;
-    bevy::log::info!(
-        "decimated mesh from {} to {} triangles (target reached: {}, error: {})",
+    info!(
+        "decimation report: triangles {} -> {}, vertices {} -> {}, target reached: {}, error: {}, parallel: {}, groups: {}, triangles before final pass: {}, removed degenerate faces: {}, removed unreferenced vertices: {}",
         result.original_face_count,
         result.decimation.final_face_count,
+        result.original_vertex_count,
+        result.decimation.final_vertex_count,
         result.decimation.reached_target,
-        result.decimation.error
+        result.decimation.error,
+        result.decimation.used_parallel_path,
+        result.decimation.group_count,
+        result.decimation.intermediate_face_count,
+        result.removed_degenerate_faces,
+        result.removed_unreferenced_vertices,
+    );
+    info!(
+        "decimation pipeline timings: total {:?}, degenerate removal {:?}, pre-decimation compaction {:?}, decimation {:?}",
+        result.timings.total,
+        result.timings.degenerate_removal,
+        result.timings.pre_decimation_compaction,
+        result.timings.decimation,
+    );
+    info!(
+        "decimation stage timings: total {:?}, input validation {:?}, meshlet build {:?}, partitioning {:?}, group simplification {:?}, group merge {:?}, final simplification {:?}, simplification {:?}, output validation {:?}, compaction {:?}",
+        result.decimation.timings.total,
+        result.decimation.timings.input_validation,
+        result.decimation.timings.meshlet_build,
+        result.decimation.timings.partitioning,
+        result.decimation.timings.group_simplification,
+        result.decimation.timings.group_merge,
+        result.decimation.timings.final_simplification,
+        result.decimation.timings.simplification,
+        result.decimation.timings.output_validation,
+        result.decimation.timings.compaction,
     );
     Ok(())
 }
@@ -521,6 +548,7 @@ mod tests {
         let request = SliceRequest {
             key: SliceKey::new("density", SliceAxis::Z, -12.5),
             range: 0.0..=1.0,
+            colormap: None,
             flip: false,
             decimation: None,
         };
@@ -564,8 +592,8 @@ mod tests {
             .build();
         let mapping = mapped_archive(&timestep.archive_path, &mappings).unwrap();
         let component_ids = job.component_ids(&variables).unwrap();
-        // SAFETY: The mapped external archive is immutable for this test.
-        let compact = unsafe { read_compact_selected_unchecked(&mapping, &component_ids) }.unwrap();
+
+        let compact = read_compact_selected(&mapping, &component_ids).unwrap();
         let mesh = build_geometry(&compact, &variables, &job).unwrap();
         assert_eq!(mesh.uv.len(), mesh.positions.len());
     }

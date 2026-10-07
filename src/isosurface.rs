@@ -15,6 +15,8 @@ const CONFIG_FILE: &str = "teph_amrex.toml";
 struct DirectoryConfig {
     #[serde(alias = "cmap")]
     colormap: Option<String>,
+    #[serde(alias = "slice_cmap")]
+    slice_colormap: Option<String>,
     decimation: Option<ConfigDecimation>,
     #[serde(default)]
     isosurfaces: Vec<ConfigIsosurface>,
@@ -39,6 +41,8 @@ struct ConfigSlice {
     quantity: String,
     axis: String,
     value: f64,
+    #[serde(alias = "cmap")]
+    colormap: Option<String>,
     #[serde(default = "default_slice_min")]
     min: f64,
     #[serde(default = "default_slice_max")]
@@ -135,6 +139,7 @@ impl SliceKey {
 pub(crate) struct SliceRequest {
     pub(crate) key: SliceKey,
     pub(crate) range: std::ops::RangeInclusive<f64>,
+    pub(crate) colormap: Option<String>,
     pub(crate) flip: bool,
     pub(crate) decimation: Option<Decimation>,
 }
@@ -142,6 +147,7 @@ pub(crate) struct SliceRequest {
 #[derive(Debug, Default)]
 pub(crate) struct InitialRequests {
     pub(crate) colormap: Option<String>,
+    pub(crate) slice_colormap: Option<String>,
     pub(crate) decimation: Option<Decimation>,
     pub(crate) isosurfaces: Vec<IsoRequest>,
     pub(crate) slices: Vec<SliceRequest>,
@@ -218,6 +224,7 @@ pub(crate) fn parse_slice_command(
     Ok(SliceRequest {
         key: SliceKey::new(quantity, axis, value),
         range: min..=max,
+        colormap: None,
         flip,
         decimation: None,
     })
@@ -317,6 +324,7 @@ pub(crate) fn load_initial_requests(
             Ok(SliceRequest {
                 key: SliceKey::new(slice.quantity, parse_slice_axis(&slice.axis)?, slice.value),
                 range: slice.min..=slice.max,
+                colormap: slice.colormap,
                 flip: slice.flip,
                 decimation: slice
                     .decimation
@@ -330,6 +338,7 @@ pub(crate) fn load_initial_requests(
 
     Ok(InitialRequests {
         colormap: config.colormap,
+        slice_colormap: config.slice_colormap,
         decimation: default_decimation,
         isosurfaces,
         slices,
@@ -478,6 +487,7 @@ mod tests {
             directory.join(CONFIG_FILE),
             r#"
                 colormap = "magma.png"
+                slice_colormap = "viridis.png"
                 decimation = { percentage = 25.0 }
 
                 [[isosurfaces]]
@@ -486,18 +496,28 @@ mod tests {
                 color_by = "temp"
                 color_min = -10.0
                 color_max = 10.0
+
+                [[slices]]
+                quantity = "temp"
+                axis = "z"
+                value = 0.25
+                min = -10.0
+                max = 10.0
+                colormap = "plasma.png"
             "#,
         )
         .unwrap();
 
         let requests = load_initial_requests(&directory, &vars()).unwrap();
         assert_eq!(requests.colormap.as_deref(), Some("magma.png"));
+        assert_eq!(requests.slice_colormap.as_deref(), Some("viridis.png"));
         assert_eq!(requests.decimation, Some(Decimation::Percentage(25.0)));
         let request = &requests.isosurfaces[0];
         assert_eq!(request.decimation, Some(Decimation::Percentage(25.0)));
         let color = request.color.as_ref().unwrap();
         assert_eq!(color.quantity, "temp");
         assert_eq!(color.range, -10.0..=10.0);
+        assert_eq!(requests.slices[0].colormap.as_deref(), Some("plasma.png"));
 
         fs::remove_file(directory.join(CONFIG_FILE)).unwrap();
         fs::remove_dir(directory).unwrap();
