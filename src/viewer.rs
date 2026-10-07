@@ -256,7 +256,7 @@ fn setup_inner(
             })
         })
         .collect();
-    let loading_mesh = meshes.add(Cuboid::new(0.16, 0.16, 0.16));
+    let loading_mesh = meshes.add(Cuboid::new(0.08, 0.08, 0.08));
     let loading_material = materials.add(StandardMaterial {
         base_color: Color::srgb(1.0, 0.35, 0.05),
         emissive: LinearRgba::rgb(4.0, 0.25, 0.02),
@@ -268,7 +268,7 @@ fn setup_inner(
             LoadingIndicator,
             Mesh3d(loading_mesh),
             MeshMaterial3d(loading_material),
-            Transform::from_xyz(-0.75, 1.5, 0.0),
+            Transform::from_xyz(-0.75, 1.5, -1.768),
             Visibility::Hidden,
         ))
         .id();
@@ -295,7 +295,7 @@ fn setup_inner(
                 double_sided: true,
                 ..default()
             })),
-            Transform::from_xyz(0.0, 1.5, 0.0).with_scale(Vec3::splat(0.25)),
+            Transform::from_xyz(0.0, 1.5, -1.768).with_scale(Vec3::splat(0.05)),
             Visibility::Hidden,
             NotShadowCaster,
             NotShadowReceiver,
