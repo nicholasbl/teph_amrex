@@ -5,7 +5,7 @@ use std::{
     path::Path,
 };
 
-use amrex_rs::SliceAxis;
+use amrex_rs::{SliceAxis, VertexRelaxOptions};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
@@ -18,6 +18,8 @@ struct DirectoryConfig {
     #[serde(alias = "slice_cmap")]
     slice_colormap: Option<String>,
     decimation: Option<ConfigDecimation>,
+    #[serde(alias = "relaxation")]
+    relax: Option<ConfigRelaxation>,
     #[serde(default)]
     isosurfaces: Vec<ConfigIsosurface>,
     #[serde(default)]
@@ -34,6 +36,8 @@ struct ConfigIsosurface {
     #[serde(default)]
     flip: bool,
     decimation: Option<ConfigDecimation>,
+    #[serde(alias = "relaxation")]
+    relax: Option<ConfigRelaxation>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,6 +54,8 @@ struct ConfigSlice {
     #[serde(default)]
     flip: bool,
     decimation: Option<ConfigDecimation>,
+    #[serde(alias = "relaxation")]
+    relax: Option<ConfigRelaxation>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,6 +63,16 @@ struct ConfigSlice {
 struct ConfigDecimation {
     triangles: Option<usize>,
     percentage: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigRelaxation {
+    iterations: Option<usize>,
+    lambda: Option<f64>,
+    mu: Option<f64>,
+    max_step_ratio: Option<f64>,
+    lock_boundaries: Option<bool>,
 }
 
 fn default_slice_min() -> f64 {
@@ -92,6 +108,7 @@ pub(crate) struct IsoRequest {
     pub(crate) color: Option<ColorRequest>,
     pub(crate) flip: bool,
     pub(crate) decimation: Option<Decimation>,
+    pub(crate) relaxation: Option<Relaxation>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +121,15 @@ pub(crate) struct ColorRequest {
 pub(crate) enum Decimation {
     Triangles(usize),
     Percentage(f32),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Relaxation {
+    pub(crate) iterations: usize,
+    pub(crate) lambda: f32,
+    pub(crate) mu: f32,
+    pub(crate) max_step_ratio: f32,
+    pub(crate) lock_boundaries: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +168,7 @@ pub(crate) struct SliceRequest {
     pub(crate) colormap: Option<String>,
     pub(crate) flip: bool,
     pub(crate) decimation: Option<Decimation>,
+    pub(crate) relaxation: Option<Relaxation>,
 }
 
 #[derive(Debug, Default)]
@@ -149,6 +176,7 @@ pub(crate) struct InitialRequests {
     pub(crate) colormap: Option<String>,
     pub(crate) slice_colormap: Option<String>,
     pub(crate) decimation: Option<Decimation>,
+    pub(crate) relaxation: Option<Relaxation>,
     pub(crate) isosurfaces: Vec<IsoRequest>,
     pub(crate) slices: Vec<SliceRequest>,
 }
@@ -181,6 +209,7 @@ pub(crate) fn parse_isosurface_command(
         color: None,
         flip,
         decimation: None,
+        relaxation: None,
     })
 }
 
@@ -227,6 +256,7 @@ pub(crate) fn parse_slice_command(
         colormap: None,
         flip,
         decimation: None,
+        relaxation: None,
     })
 }
 
@@ -248,6 +278,7 @@ pub(crate) fn load_initial_requests(
         .as_ref()
         .map(parse_decimation)
         .transpose()?;
+    let default_relaxation = config.relax.as_ref().map(parse_relaxation).transpose()?;
 
     let isosurfaces = config
         .isosurfaces
@@ -297,6 +328,12 @@ pub(crate) fn load_initial_requests(
                     .map(parse_decimation)
                     .transpose()?
                     .or_else(|| default_decimation.clone()),
+                relaxation: surface
+                    .relax
+                    .as_ref()
+                    .map(parse_relaxation)
+                    .transpose()?
+                    .or_else(|| default_relaxation.clone()),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -332,6 +369,12 @@ pub(crate) fn load_initial_requests(
                     .map(parse_decimation)
                     .transpose()?
                     .or_else(|| default_decimation.clone()),
+                relaxation: slice
+                    .relax
+                    .as_ref()
+                    .map(parse_relaxation)
+                    .transpose()?
+                    .or_else(|| default_relaxation.clone()),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -340,6 +383,7 @@ pub(crate) fn load_initial_requests(
         colormap: config.colormap,
         slice_colormap: config.slice_colormap,
         decimation: default_decimation,
+        relaxation: default_relaxation,
         isosurfaces,
         slices,
     })
@@ -368,6 +412,39 @@ fn parse_decimation(config: &ConfigDecimation) -> Result<Decimation> {
         }
         (None, None) => bail!("decimation must specify triangles or percentage"),
     }
+}
+
+fn parse_relaxation(config: &ConfigRelaxation) -> Result<Relaxation> {
+    let defaults = VertexRelaxOptions::default();
+    let lambda = config.lambda.unwrap_or(defaults.lambda as f64);
+    let mu = config.mu.unwrap_or(defaults.mu as f64);
+    let max_step_ratio = config
+        .max_step_ratio
+        .unwrap_or(defaults.max_step_ratio as f64);
+    ensure!(
+        lambda.is_finite() && (0.0..=1.0).contains(&lambda),
+        "relaxation lambda must be finite and in [0, 1]"
+    );
+    ensure!(
+        mu.is_finite() && (-1.0..=0.0).contains(&mu),
+        "relaxation mu must be finite and in [-1, 0]"
+    );
+    ensure!(
+        max_step_ratio.is_finite() && max_step_ratio >= 0.0,
+        "relaxation max_step_ratio must be finite and non-negative"
+    );
+    let max_step_ratio = max_step_ratio as f32;
+    ensure!(
+        max_step_ratio.is_finite(),
+        "relaxation max_step_ratio is too large to represent"
+    );
+    Ok(Relaxation {
+        iterations: config.iterations.unwrap_or(defaults.iterations),
+        lambda: lambda as f32,
+        mu: mu as f32,
+        max_step_ratio,
+        lock_boundaries: config.lock_boundaries.unwrap_or(defaults.lock_boundaries),
+    })
 }
 
 pub(crate) fn slice_axis_label(axis: SliceAxis) -> &'static str {
@@ -479,6 +556,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_relaxation_options_with_library_defaults() {
+        let config: DirectoryConfig =
+            toml::from_str("relax = { iterations = 5, lambda = 0.4 }").unwrap();
+        let relaxation = parse_relaxation(config.relax.as_ref().unwrap()).unwrap();
+        let defaults = VertexRelaxOptions::default();
+
+        assert_eq!(relaxation.iterations, 5);
+        assert_eq!(relaxation.lambda, 0.4);
+        assert_eq!(relaxation.mu, defaults.mu);
+        assert_eq!(relaxation.max_step_ratio, defaults.max_step_ratio);
+        assert_eq!(relaxation.lock_boundaries, defaults.lock_boundaries);
+    }
+
+    #[test]
+    fn rejects_invalid_relaxation_options() {
+        for text in [
+            "relax = { lambda = 1.1 }",
+            "relax = { mu = -1.1 }",
+            "relax = { max_step_ratio = -0.1 }",
+        ] {
+            let config: DirectoryConfig = toml::from_str(text).unwrap();
+            assert!(parse_relaxation(config.relax.as_ref().unwrap()).is_err());
+        }
+    }
+
+    #[test]
     fn loads_colored_isosurface_config() {
         let directory =
             std::env::temp_dir().join(format!("teph_amrex_colored_config_{}", std::process::id()));
@@ -489,6 +592,7 @@ mod tests {
                 colormap = "magma.png"
                 slice_colormap = "viridis.png"
                 decimation = { percentage = 25.0 }
+                relax = { iterations = 4 }
 
                 [[isosurfaces]]
                 quantity = "density"
@@ -504,6 +608,7 @@ mod tests {
                 min = -10.0
                 max = 10.0
                 colormap = "plasma.png"
+                relax = { iterations = 2, lock_boundaries = false }
             "#,
         )
         .unwrap();
@@ -514,10 +619,14 @@ mod tests {
         assert_eq!(requests.decimation, Some(Decimation::Percentage(25.0)));
         let request = &requests.isosurfaces[0];
         assert_eq!(request.decimation, Some(Decimation::Percentage(25.0)));
+        assert_eq!(request.relaxation.as_ref().unwrap().iterations, 4);
         let color = request.color.as_ref().unwrap();
         assert_eq!(color.quantity, "temp");
         assert_eq!(color.range, -10.0..=10.0);
         assert_eq!(requests.slices[0].colormap.as_deref(), Some("plasma.png"));
+        let slice_relaxation = requests.slices[0].relaxation.as_ref().unwrap();
+        assert_eq!(slice_relaxation.iterations, 2);
+        assert!(!slice_relaxation.lock_boundaries);
 
         fs::remove_file(directory.join(CONFIG_FILE)).unwrap();
         fs::remove_dir(directory).unwrap();

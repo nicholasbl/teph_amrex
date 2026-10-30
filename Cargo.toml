@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 tephrite_rs = { git = "https://github.com/InsightCenterNoodles/tephrite_rs.git", rev = "2de4d12109af827aab2d59319960efbd972c9efe" }
-amrex_rs = { git = "https://github.com/nicholasbl/amrex_rs.git", rev = "59017aa0ad9212fb7561d14bd981b40d7197e088" }
+amrex_rs = { git = "https://github.com/nicholasbl/amrex_rs.git", rev = "bff0e971921ed58b7b2377c6564a873dd2a05680" }
 bevy = "0.19"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"

@@ -8,9 +8,10 @@ use std::{
 };
 
 use amrex_rs::{
-    DecimateOptions, DecimatePipelineOptions, DecimateTarget, IsosurfaceOptions, Sample,
-    SliceOptions, SlicePlane, Surface, decimate_mesh_pipeline, isosurface_compact,
-    read_compact_selected, slice_compact,
+    DecimateOptions, DecimatePipelineOptions, DecimateTarget, IsosurfaceOptions,
+    RemoveDegenerateTrianglesOptions, Sample, SliceOptions, SlicePlane, Surface,
+    VertexRelaxOptions, decimate_mesh_pipeline, isosurface_compact, read_compact_selected,
+    relax_mesh_vertices, remove_degenerate_triangles, slice_compact,
 };
 use anyhow::{Context, Result};
 use bevy::{log::info, prelude::Mesh};
@@ -19,7 +20,7 @@ use memmap2::Mmap;
 use mini_moka::sync::Cache;
 
 use crate::{
-    isosurface::{Decimation, IsoRequest, SliceRequest},
+    isosurface::{Decimation, IsoRequest, Relaxation, SliceRequest},
     mesh::mesh3d_to_bevy_mesh,
 };
 
@@ -37,6 +38,7 @@ pub(crate) enum GeometryKey {
         color: Option<ColorKey>,
         flip: bool,
         decimation: Option<DecimationKey>,
+        relaxation: Option<RelaxationKey>,
     },
     Slice {
         archive_path: PathBuf,
@@ -47,6 +49,7 @@ pub(crate) enum GeometryKey {
         max_bits: u64,
         flip: bool,
         decimation: Option<DecimationKey>,
+        relaxation: Option<RelaxationKey>,
     },
 }
 
@@ -61,6 +64,27 @@ impl From<&Decimation> for DecimationKey {
         match decimation {
             Decimation::Triangles(count) => Self::Triangles(*count),
             Decimation::Percentage(percentage) => Self::PercentageBits(percentage.to_bits()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RelaxationKey {
+    iterations: usize,
+    lambda_bits: u32,
+    mu_bits: u32,
+    max_step_ratio_bits: u32,
+    lock_boundaries: bool,
+}
+
+impl From<&Relaxation> for RelaxationKey {
+    fn from(relaxation: &Relaxation) -> Self {
+        Self {
+            iterations: relaxation.iterations,
+            lambda_bits: relaxation.lambda.to_bits(),
+            mu_bits: relaxation.mu.to_bits(),
+            max_step_ratio_bits: relaxation.max_step_ratio.to_bits(),
+            lock_boundaries: relaxation.lock_boundaries,
         }
     }
 }
@@ -109,6 +133,7 @@ impl GeometryJob {
                 color,
                 flip: request.flip,
                 decimation: request.decimation.as_ref().map(DecimationKey::from),
+                relaxation: request.relaxation.as_ref().map(RelaxationKey::from),
             },
             request: GeometryRequest::Isosurface(request.clone()),
         }
@@ -130,6 +155,7 @@ impl GeometryJob {
                 max_bits: request.range.end().to_bits(),
                 flip: request.flip,
                 decimation: request.decimation.as_ref().map(DecimationKey::from),
+                relaxation: request.relaxation.as_ref().map(RelaxationKey::from),
             },
             request: GeometryRequest::Slice(request.clone()),
         }
@@ -331,7 +357,7 @@ fn build_geometry(
     job: &GeometryJob,
 ) -> Result<amrex_rs::Mesh3D> {
     info!("Building geometry");
-    let (mut mesh, decimation) = match &job.request {
+    let (mut mesh, decimation, relaxation) = match &job.request {
         GeometryRequest::Isosurface(request) => {
             let surface_id = component_id(variables, &request.key.quantity)?;
             let sampled_quantities = request
@@ -357,13 +383,18 @@ fn build_geometry(
                     flip_winding: request.flip,
                 },
             )?;
-            (mesh, request.decimation.as_ref())
+            (
+                mesh,
+                request.decimation.as_ref(),
+                request.relaxation.as_ref(),
+            )
         }
         GeometryRequest::Slice(request) => {
             let id = component_id(variables, &request.key.quantity)?;
             (
                 slice_compact(compact, slice_options(request, id))?,
                 request.decimation.as_ref(),
+                request.relaxation.as_ref(),
             )
         }
     };
@@ -374,9 +405,45 @@ fn build_geometry(
         info!("Decimating mesh after: {}", mesh.positions.len());
     }
 
+    if let Some(relaxation) = relaxation {
+        relax_geometry(&mut mesh, relaxation)?;
+    }
+
     info!("Built mesh, size {}", mesh.positions.len());
 
     Ok(mesh)
+}
+
+fn relax_geometry(mesh: &mut amrex_rs::Mesh3D, relaxation: &Relaxation) -> Result<()> {
+    info!("Relaxing mesh with {} vertices", mesh.positions.len());
+    let removed_degenerate_faces =
+        remove_degenerate_triangles(mesh, RemoveDegenerateTrianglesOptions { area_epsilon: 0.0 })?;
+    let result = relax_mesh_vertices(
+        mesh,
+        VertexRelaxOptions {
+            iterations: relaxation.iterations,
+            lambda: relaxation.lambda,
+            mu: relaxation.mu,
+            max_step_ratio: relaxation.max_step_ratio,
+            lock_boundaries: relaxation.lock_boundaries,
+        },
+    )?;
+    info!(
+        "relaxation report: relaxed vertices {}, locked vertices {}, removed degenerate faces {}, iterations {}, lambda {}, mu {}, max step ratio {}, lock boundaries {}",
+        result.relaxed_vertex_count,
+        result.locked_vertex_count,
+        removed_degenerate_faces,
+        relaxation.iterations,
+        relaxation.lambda,
+        relaxation.mu,
+        relaxation.max_step_ratio,
+        relaxation.lock_boundaries,
+    );
+    info!(
+        "relaxation timings: total {:?}, adjacency build {:?}, relaxation {:?}",
+        result.timings.total, result.timings.adjacency_build, result.timings.relaxation,
+    );
+    Ok(())
 }
 
 fn decimate_geometry(mesh: &mut amrex_rs::Mesh3D, decimation: &Decimation) -> Result<()> {
@@ -492,6 +559,7 @@ mod tests {
             color: None,
             flip: false,
             decimation: None,
+            relaxation: None,
         };
         let first = GeometryJob::isosurface(&PathBuf::from("step-1.compact"), &request);
         let second = GeometryJob::isosurface(&PathBuf::from("step-2.compact"), &request);
@@ -505,6 +573,7 @@ mod tests {
             color: None,
             flip,
             decimation: None,
+            relaxation: None,
         };
         let archive = PathBuf::from("step.compact");
 
@@ -521,6 +590,7 @@ mod tests {
             color: None,
             flip: false,
             decimation,
+            relaxation: None,
         };
         let archive = PathBuf::from("step.compact");
 
@@ -529,6 +599,30 @@ mod tests {
             GeometryJob::isosurface(&archive, &request(Some(Decimation::Percentage(25.0))));
 
         assert_ne!(full.key, reduced.key);
+    }
+
+    #[test]
+    fn geometry_keys_distinguish_relaxation_options() {
+        let request = |relaxation| IsoRequest {
+            key: IsoKey::new("E", 1.0e19),
+            color: None,
+            flip: false,
+            decimation: None,
+            relaxation,
+        };
+        let archive = PathBuf::from("step.compact");
+        let relaxed = Relaxation {
+            iterations: 3,
+            lambda: 0.5,
+            mu: -0.53,
+            max_step_ratio: 0.25,
+            lock_boundaries: true,
+        };
+
+        let original = GeometryJob::isosurface(&archive, &request(None));
+        let smoothed = GeometryJob::isosurface(&archive, &request(Some(relaxed)));
+
+        assert_ne!(original.key, smoothed.key);
     }
 
     #[test]
@@ -551,6 +645,7 @@ mod tests {
             colormap: None,
             flip: false,
             decimation: None,
+            relaxation: None,
         };
 
         let options = slice_options(&request, 7);
@@ -584,6 +679,7 @@ mod tests {
             }),
             flip: false,
             decimation: None,
+            relaxation: None,
         };
         let job = GeometryJob::isosurface(&timestep.archive_path, &request);
         let mappings = Cache::builder()

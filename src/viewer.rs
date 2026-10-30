@@ -22,7 +22,7 @@ use crate::{
         FulfillmentRequest, FulfillmentResult, FulfillmentWorker, GeometryJob, GeometryKey,
     },
     isosurface::{
-        Decimation, IsoKey, IsoRequest, SliceKey, SliceRequest, load_initial_requests,
+        Decimation, IsoKey, IsoRequest, Relaxation, SliceKey, SliceRequest, load_initial_requests,
         parse_isosurface_command, parse_slice_command, slice_axis_label,
     },
 };
@@ -73,6 +73,7 @@ struct ViewerState {
     current_colormap: usize,
     current_slice_colormap: usize,
     default_decimation: Option<Decimation>,
+    default_relaxation: Option<Relaxation>,
     slice_material: Handle<StandardMaterial>,
     slice_override_materials: Vec<Handle<StandardMaterial>>,
     geometry_transform: Transform,
@@ -322,6 +323,7 @@ fn setup_inner(
         current_colormap,
         current_slice_colormap,
         default_decimation: requests.decimation.clone(),
+        default_relaxation: requests.relaxation.clone(),
         slice_material,
         slice_override_materials,
         geometry_transform,
@@ -620,6 +622,7 @@ fn on_add_isosurface(
     match parse_isosurface_command(text, &state.variables) {
         Ok(mut request) => {
             request.decimation = state.default_decimation.clone();
+            request.relaxation = state.default_relaxation.clone();
             replace_isosurface_request(&mut commands, &mut defs, &mut state, request);
             request_fulfillment(&mut commands, &mut state, root.0);
         }
@@ -645,6 +648,7 @@ fn on_add_slice(
     match parse_slice_command(text, &state.variables) {
         Ok(mut request) => {
             request.decimation = state.default_decimation.clone();
+            request.relaxation = state.default_relaxation.clone();
             replace_slice_request(&mut commands, &mut defs, &mut state, request);
             request_fulfillment(&mut commands, &mut state, root.0);
         }
@@ -1227,12 +1231,14 @@ mod tests {
                 color: None,
                 flip: false,
                 decimation: None,
+                relaxation: None,
             },
             IsoRequest {
                 key: IsoKey::new("density", 0.75),
                 color: None,
                 flip: true,
                 decimation: None,
+                relaxation: None,
             },
         ];
 
