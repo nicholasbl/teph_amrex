@@ -1,6 +1,9 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use bevy::{
     asset::RenderAssetUsages,
     image::{ImageSampler, ImageSamplerDescriptor},
@@ -17,7 +20,7 @@ use crate::{
         BUILTIN_COLORMAP_DIR, ColorMapSelection, discover_builtin_colormaps, load_colormap_image,
         select_colormap,
     },
-    discovery::{TimestepInfo, discover_archive_timesteps, variables_from_compact},
+    discovery::{TimestepInfo, discover_archive_timesteps},
     fulfillment::{
         FulfillmentRequest, FulfillmentResult, FulfillmentWorker, GeometryJob, GeometryKey,
     },
@@ -61,7 +64,7 @@ struct PendingState {
 struct ViewerState {
     timesteps: Vec<TimestepInfo>,
     current: usize,
-    variables: HashMap<String, u32>,
+    fields: HashSet<String>,
     isosurface_requests: Vec<IsoRequest>,
     slice_requests: Vec<SliceRequest>,
     delete_isosurface_controls: HashMap<IsoKey, Entity>,
@@ -172,7 +175,7 @@ fn setup(
         &mut server,
         root_id,
     ) {
-        error!("unable to set up AMReX viewer: {err:?}");
+        error!("unable to set up MSG viewer: {err:?}");
     }
 }
 
@@ -189,12 +192,13 @@ fn setup_inner(
     let timestep_infos = discover_archive_timesteps(&dir.0)?;
     ensure!(
         !timestep_infos.is_empty(),
-        "no .packed or .compact timesteps found in {}",
+        "no .msg timesteps found in {}",
         dir.0.display()
     );
-    let variables = variables_from_compact(&timestep_infos[0].archive_path)?;
-    let geometry_transform = fit_domain_transform(timestep_infos[0].domain)?;
-    let requests = load_initial_requests(&dir.0, &variables)?;
+    let fields = timestep_infos[0].fields.clone();
+    let domain = combined_domain(&timestep_infos);
+    let geometry_transform = fit_domain_transform(domain)?;
+    let requests = load_initial_requests(&dir.0, &fields)?;
     let requested_slice_colormaps = requests
         .slices
         .iter()
@@ -213,7 +217,7 @@ fn setup_inner(
         .unwrap_or(current_colormap);
     info!(
         "fitting archive domain {:?} with geometry transform {:?}",
-        timestep_infos[0].domain, geometry_transform
+        domain, geometry_transform
     );
 
     let isosurface_material = materials.add(StandardMaterial {
@@ -303,7 +307,7 @@ fn setup_inner(
         ))
         .id();
 
-    let fulfillment = FulfillmentWorker::launch(variables.clone());
+    let fulfillment = FulfillmentWorker::launch();
     let mesh_cache = Cache::builder()
         .max_capacity(MESH_CACHE_CAPACITY_MIB)
         .weigher(|_key: &GeometryKey, mesh: &CachedMesh| mesh_weight_mib(mesh.estimated_bytes))
@@ -311,7 +315,7 @@ fn setup_inner(
     let mut state = ViewerState {
         timesteps: timestep_infos,
         current: 0,
-        variables,
+        fields,
         isosurface_requests: Vec::new(),
         slice_requests: Vec::new(),
         delete_isosurface_controls: HashMap::new(),
@@ -377,6 +381,18 @@ fn fit_domain_transform((min, max): ([f64; 3], [f64; 3])) -> Result<Transform> {
         scale: Vec3::splat(scale as f32),
         ..default()
     })
+}
+
+fn combined_domain(timesteps: &[TimestepInfo]) -> ([f64; 3], [f64; 3]) {
+    let mut minimum = [f64::INFINITY; 3];
+    let mut maximum = [f64::NEG_INFINITY; 3];
+    for timestep in timesteps {
+        for axis in 0..3 {
+            minimum[axis] = minimum[axis].min(timestep.domain.0[axis]);
+            maximum[axis] = maximum[axis].max(timestep.domain.1[axis]);
+        }
+    }
+    (minimum, maximum)
 }
 
 fn color_ramp_image() -> Image {
@@ -619,7 +635,7 @@ fn on_add_isosurface(
         return;
     };
 
-    match parse_isosurface_command(text, &state.variables) {
+    match parse_isosurface_command(text, &state.fields) {
         Ok(mut request) => {
             request.decimation = state.default_decimation.clone();
             request.relaxation = state.default_relaxation.clone();
@@ -645,7 +661,7 @@ fn on_add_slice(
         return;
     };
 
-    match parse_slice_command(text, &state.variables) {
+    match parse_slice_command(text, &state.fields) {
         Ok(mut request) => {
             request.decimation = state.default_decimation.clone();
             request.relaxation = state.default_relaxation.clone();
@@ -1197,17 +1213,33 @@ mod tests {
     }
 
     #[test]
-    fn timestep_label_includes_index_name_and_time() {
-        let info = TimestepInfo {
-            archive_path: "plt00005.compact".into(),
-            name: "plt00005.compact".into(),
-            simulation_time: 1.25e-6,
-            domain: ([0.0; 3], [1.0; 3]),
+    fn combines_timestep_domains() {
+        let timestep = |domain| TimestepInfo {
+            archive_path: "step.msg".into(),
+            name: "step.msg".into(),
+            simulation_time: 0.0,
+            domain,
+            fields: HashSet::new(),
         };
         assert_eq!(
-            timestep_label(2, &info),
-            "2: plt00005.compact (t=1.250000e-6)"
+            combined_domain(&[
+                timestep(([-1.0, 2.0, 0.0], [3.0, 4.0, 2.0])),
+                timestep(([-2.0, 3.0, -1.0], [2.0, 5.0, 1.0])),
+            ]),
+            ([-2.0, 2.0, -1.0], [3.0, 5.0, 2.0])
         );
+    }
+
+    #[test]
+    fn timestep_label_includes_index_name_and_time() {
+        let info = TimestepInfo {
+            archive_path: "plt00005.msg".into(),
+            name: "plt00005.msg".into(),
+            simulation_time: 1.25e-6,
+            domain: ([0.0; 3], [1.0; 3]),
+            fields: HashSet::from(["density".to_string()]),
+        };
+        assert_eq!(timestep_label(2, &info), "2: plt00005.msg (t=1.250000e-6)");
     }
 
     #[test]
@@ -1224,7 +1256,7 @@ mod tests {
 
     #[test]
     fn preserves_multiple_distinct_isosurfaces_in_one_geometry_batch() {
-        let archive = PathBuf::from("step.compact");
+        let archive = PathBuf::from("step.msg");
         let requests = [
             IsoRequest {
                 key: IsoKey::new("density", 0.25),

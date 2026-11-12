@@ -1,9 +1,9 @@
-use amrex_rs::Mesh3D;
 use bevy::{
     asset::RenderAssetUsages,
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
 };
+use multires::Mesh3D;
 
 pub(crate) fn mesh3d_to_bevy_mesh(mesh: Mesh3D) -> (Option<Mesh>, u64) {
     let vertex_count = mesh.positions.len();

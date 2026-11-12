@@ -1,23 +1,20 @@
 use std::{
-    collections::{HashMap, HashSet},
-    fs::File,
     path::PathBuf,
     sync::Arc,
     thread::{self, Thread},
     time::Duration,
 };
 
-use amrex_rs::{
-    DecimateOptions, DecimatePipelineOptions, DecimateTarget, IsosurfaceOptions,
-    RemoveDegenerateTrianglesOptions, Sample, SliceOptions, SlicePlane, Surface,
-    VertexRelaxOptions, decimate_mesh_pipeline, isosurface_compact, read_compact_selected,
-    relax_mesh_vertices, remove_degenerate_triangles, slice_compact,
-};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use bevy::{log::info, prelude::Mesh};
 use crossbeam_queue::ArrayQueue;
-use memmap2::Mmap;
 use mini_moka::sync::Cache;
+use multires::{
+    DecimateOptions, DecimatePipelineOptions, DecimateTarget, IsosurfaceOptions, MappedMsgArchive,
+    Mesh3D, MsgArchive, MsgNormalization, RemoveDegenerateTrianglesOptions, Sample, SliceAxis,
+    SliceOptions, SlicePlane, Surface, VertexRelaxOptions, decimate_mesh_pipeline,
+    isosurface_archive, relax_mesh_vertices, remove_degenerate_triangles, slice_archive,
+};
 
 use crate::{
     isosurface::{Decimation, IsoRequest, Relaxation, SliceRequest},
@@ -45,8 +42,7 @@ pub(crate) enum GeometryKey {
         quantity: String,
         axis: u8,
         value_bits: u64,
-        min_bits: u64,
-        max_bits: u64,
+        range_bits: Option<(u64, u64)>,
         flip: bool,
         decimation: Option<DecimationKey>,
         relaxation: Option<RelaxationKey>,
@@ -141,9 +137,9 @@ impl GeometryJob {
 
     pub(crate) fn slice(archive_path: &PathBuf, request: &SliceRequest) -> Self {
         let axis = match request.key.axis {
-            amrex_rs::SliceAxis::X => 0,
-            amrex_rs::SliceAxis::Y => 1,
-            amrex_rs::SliceAxis::Z => 2,
+            SliceAxis::X => 0,
+            SliceAxis::Y => 1,
+            SliceAxis::Z => 2,
         };
         Self {
             key: GeometryKey::Slice {
@@ -151,28 +147,15 @@ impl GeometryJob {
                 quantity: request.key.quantity.clone(),
                 axis,
                 value_bits: request.key.value().to_bits(),
-                min_bits: request.range.start().to_bits(),
-                max_bits: request.range.end().to_bits(),
+                range_bits: request
+                    .range
+                    .as_ref()
+                    .map(|range| (range.start().to_bits(), range.end().to_bits())),
                 flip: request.flip,
                 decimation: request.decimation.as_ref().map(DecimationKey::from),
                 relaxation: request.relaxation.as_ref().map(RelaxationKey::from),
             },
             request: GeometryRequest::Slice(request.clone()),
-        }
-    }
-
-    fn component_ids(&self, variables: &HashMap<String, u32>) -> Result<Vec<u32>> {
-        match &self.request {
-            GeometryRequest::Isosurface(request) => {
-                let mut ids = vec![component_id(variables, &request.key.quantity)?];
-                if let Some(color) = &request.color {
-                    ids.push(component_id(variables, &color.quantity)?);
-                }
-                Ok(ids)
-            }
-            GeometryRequest::Slice(request) => {
-                Ok(vec![component_id(variables, &request.key.quantity)?])
-            }
         }
     }
 }
@@ -206,15 +189,15 @@ pub(crate) struct FulfillmentWorker {
 }
 
 impl FulfillmentWorker {
-    pub(crate) fn launch(variables: HashMap<String, u32>) -> Self {
+    pub(crate) fn launch() -> Self {
         let requests = Arc::new(ArrayQueue::new(REQUEST_QUEUE_CAPACITY));
         let results = Arc::new(ArrayQueue::new(RESULT_QUEUE_CAPACITY));
         let worker_requests = Arc::clone(&requests);
         let worker_results = Arc::clone(&results);
         let handle = thread::Builder::new()
-            .name("amrex-fulfillment".into())
-            .spawn(move || fulfillment_loop(worker_requests, worker_results, variables))
-            .expect("spawning AMReX fulfillment thread");
+            .name("msg-fulfillment".into())
+            .spawn(move || fulfillment_loop(worker_requests, worker_results))
+            .expect("spawning MSG fulfillment thread");
         let thread = handle.thread().clone();
         drop(handle);
         Self {
@@ -237,11 +220,12 @@ impl FulfillmentWorker {
 fn fulfillment_loop(
     requests: Arc<ArrayQueue<FulfillmentRequest>>,
     results: Arc<ArrayQueue<FulfillmentResult>>,
-    variables: HashMap<String, u32>,
 ) {
     let mappings = Cache::builder()
         .max_capacity(MAPPED_ARCHIVE_CAPACITY_MIB)
-        .weigher(|_path: &PathBuf, mapping: &Arc<Mmap>| mapping_weight_mib(mapping.len()))
+        .weigher(|_path: &PathBuf, mapping: &Arc<MappedMsgArchive>| {
+            mapping_weight_mib(mapping.bytes().len())
+        })
         .build();
 
     loop {
@@ -251,7 +235,7 @@ fn fulfillment_loop(
         };
 
         loop {
-            match fulfill_request(&request, &requests, &results, &variables, &mappings) {
+            match fulfill_request(&request, &requests, &results, &mappings) {
                 WorkOutcome::Complete => break,
                 WorkOutcome::Superseded(next) => request = next,
             }
@@ -268,8 +252,7 @@ fn fulfill_request(
     request: &FulfillmentRequest,
     requests: &ArrayQueue<FulfillmentRequest>,
     results: &ArrayQueue<FulfillmentResult>,
-    variables: &HashMap<String, u32>,
-    mappings: &Cache<PathBuf, Arc<Mmap>>,
+    mappings: &Cache<PathBuf, Arc<MappedMsgArchive>>,
 ) -> WorkOutcome {
     if let Some(next) = requests.pop() {
         return WorkOutcome::Superseded(next);
@@ -280,20 +263,9 @@ fn fulfill_request(
             return Ok(());
         }
         let mapping = mapped_archive(&request.archive_path, mappings)?;
-        let mut selected = Vec::new();
-        let mut seen = HashSet::new();
-        for job in &request.jobs {
-            for id in job.component_ids(variables)? {
-                if seen.insert(id) {
-                    selected.push(id);
-                }
-            }
-        }
-
-        // SAFETY: Compact archives are treated as immutable for the viewer's
-        // lifetime and were produced by the matching amrex_rs archive format.
-        let compact = read_compact_selected(&mapping, &selected)
-            .with_context(|| format!("selectively decoding {}", request.archive_path.display()))?;
+        let archive = mapping
+            .view()
+            .with_context(|| format!("reading MSG archive {}", request.archive_path.display()))?;
 
         for job in &request.jobs {
             // Leave the replacement in the queue for the handoff below. There
@@ -302,7 +274,7 @@ fn fulfill_request(
             if !requests.is_empty() {
                 return Ok(());
             }
-            let mesh = build_geometry(&compact, variables, job)?;
+            let mesh = build_geometry(&archive, job)?;
             let (mesh, estimated_bytes) = mesh3d_to_bevy_mesh(mesh);
             push_result(
                 results,
@@ -337,46 +309,47 @@ fn fulfill_request(
     WorkOutcome::Complete
 }
 
-fn mapped_archive(path: &PathBuf, mappings: &Cache<PathBuf, Arc<Mmap>>) -> Result<Arc<Mmap>> {
+fn mapped_archive(
+    path: &PathBuf,
+    mappings: &Cache<PathBuf, Arc<MappedMsgArchive>>,
+) -> Result<Arc<MappedMsgArchive>> {
     if let Some(mapping) = mappings.get(path) {
         return Ok(mapping);
     }
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    // SAFETY: The viewer treats archive files as immutable while mapped.
-    let mapping = Arc::new(
-        unsafe { Mmap::map(&file) }
-            .with_context(|| format!("memory mapping {}", path.display()))?,
-    );
+    let mapping = Arc::new(MappedMsgArchive::open(path)?);
     mappings.insert(path.clone(), Arc::clone(&mapping));
     Ok(mapping)
 }
 
-fn build_geometry(
-    compact: &amrex_rs::CompactPlot,
-    variables: &HashMap<String, u32>,
-    job: &GeometryJob,
-) -> Result<amrex_rs::Mesh3D> {
+fn build_geometry(archive: &MsgArchive<'_>, job: &GeometryJob) -> Result<Mesh3D> {
     info!("Building geometry");
     let (mut mesh, decimation, relaxation) = match &job.request {
         GeometryRequest::Isosurface(request) => {
-            let surface_id = component_id(variables, &request.key.quantity)?;
             let sampled_quantities = request
                 .color
                 .as_ref()
                 .map(|color| {
                     Ok(Sample {
-                        id: component_id(variables, &color.quantity)?,
-                        range: color.range.clone(),
+                        field: color.quantity.clone(),
+                        range: archive_logical_range(
+                            archive,
+                            &color.quantity,
+                            color.range.clone(),
+                        )?,
                     })
                 })
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
-            let (mesh, _timings) = isosurface_compact(
-                compact,
+            let (mesh, _timings) = isosurface_archive(
+                archive,
                 IsosurfaceOptions {
                     surface: Surface {
-                        id: surface_id,
-                        value: request.key.value(),
+                        field: request.key.quantity.clone(),
+                        value: archive_logical_value(
+                            archive,
+                            &request.key.quantity,
+                            request.key.value(),
+                        )?,
                     },
                     sampled_quantities,
                     levels: None,
@@ -389,14 +362,11 @@ fn build_geometry(
                 request.relaxation.as_ref(),
             )
         }
-        GeometryRequest::Slice(request) => {
-            let id = component_id(variables, &request.key.quantity)?;
-            (
-                slice_compact(compact, slice_options(request, id))?,
-                request.decimation.as_ref(),
-                request.relaxation.as_ref(),
-            )
-        }
+        GeometryRequest::Slice(request) => (
+            slice_archive(archive, slice_options(archive, request)?)?,
+            request.decimation.as_ref(),
+            request.relaxation.as_ref(),
+        ),
     };
 
     if let Some(decimation) = decimation {
@@ -414,7 +384,7 @@ fn build_geometry(
     Ok(mesh)
 }
 
-fn relax_geometry(mesh: &mut amrex_rs::Mesh3D, relaxation: &Relaxation) -> Result<()> {
+fn relax_geometry(mesh: &mut Mesh3D, relaxation: &Relaxation) -> Result<()> {
     info!("Relaxing mesh with {} vertices", mesh.positions.len());
     let removed_degenerate_faces =
         remove_degenerate_triangles(mesh, RemoveDegenerateTrianglesOptions { area_epsilon: 0.0 })?;
@@ -446,7 +416,7 @@ fn relax_geometry(mesh: &mut amrex_rs::Mesh3D, relaxation: &Relaxation) -> Resul
     Ok(())
 }
 
-fn decimate_geometry(mesh: &mut amrex_rs::Mesh3D, decimation: &Decimation) -> Result<()> {
+fn decimate_geometry(mesh: &mut Mesh3D, decimation: &Decimation) -> Result<()> {
     let target = decimation_target(decimation);
     let result = decimate_mesh_pipeline(
         mesh,
@@ -502,28 +472,63 @@ fn decimation_target(decimation: &Decimation) -> DecimateTarget {
     }
 }
 
-fn slice_options(request: &SliceRequest, component_id: u32) -> SliceOptions {
-    SliceOptions {
+fn slice_options(archive: &MsgArchive<'_>, request: &SliceRequest) -> Result<SliceOptions> {
+    let physical_range = match &request.range {
+        Some(range) => range.clone(),
+        None => archive
+            .field(&request.key.quantity)
+            .with_context(|| format!("unknown field {:?}", request.key.quantity))?
+            .normalization()
+            .map_or(0.0..=1.0, |normalization| {
+                normalization.min..=normalization.max
+            }),
+    };
+    Ok(SliceOptions {
+        topology_field: request.key.quantity.clone(),
         plane: SlicePlane {
             axis: request.key.axis,
-            // Slice coordinates are AMReX dataset coordinates. The viewer's
-            // world-space fitting transform is applied only after extraction.
-            value: request.key.value(),
+            coordinate: request.key.value(),
         },
         sampled_quantities: vec![Sample {
-            id: component_id,
-            range: request.range.clone(),
+            field: request.key.quantity.clone(),
+            range: archive_logical_range(archive, &request.key.quantity, physical_range)?,
         }],
         levels: None,
         flip_winding: request.flip,
-    }
+    })
 }
 
-fn component_id(variables: &HashMap<String, u32>, quantity: &str) -> Result<u32> {
-    variables
-        .get(quantity)
-        .copied()
-        .with_context(|| format!("unknown quantity {quantity:?}"))
+fn archive_logical_value(archive: &MsgArchive<'_>, field: &str, physical: f64) -> Result<f64> {
+    let field = archive
+        .field(field)
+        .with_context(|| format!("unknown field {field:?}"))?;
+    let logical = logical_value(field.normalization(), physical);
+    ensure!(
+        logical.is_finite(),
+        "physical value {physical} for field {:?} cannot be represented in its logical domain",
+        field.name()
+    );
+    Ok(logical)
+}
+
+fn archive_logical_range(
+    archive: &MsgArchive<'_>,
+    field: &str,
+    physical: std::ops::RangeInclusive<f64>,
+) -> Result<std::ops::RangeInclusive<f64>> {
+    let start = archive_logical_value(archive, field, *physical.start())?;
+    let end = archive_logical_value(archive, field, *physical.end())?;
+    ensure!(
+        end > start,
+        "physical sample range for field {field:?} is empty or reversed"
+    );
+    Ok(start..=end)
+}
+
+fn logical_value(normalization: Option<MsgNormalization>, physical: f64) -> f64 {
+    normalization.map_or(physical, |normalization| {
+        (physical - normalization.min) / (normalization.max - normalization.min)
+    })
 }
 
 fn mapping_weight_mib(bytes: usize) -> u32 {
@@ -546,10 +551,9 @@ fn push_result(queue: &ArrayQueue<FulfillmentResult>, mut result: FulfillmentRes
 mod tests {
     use super::*;
     use crate::{
-        discovery::{discover_archive_timesteps, variables_from_compact},
-        isosurface::{ColorRequest, IsoKey, SliceKey},
+        discovery::discover_archive_timesteps,
+        isosurface::{ColorRequest, IsoKey},
     };
-    use amrex_rs::SliceAxis;
     use std::path::Path;
 
     #[test]
@@ -561,8 +565,8 @@ mod tests {
             decimation: None,
             relaxation: None,
         };
-        let first = GeometryJob::isosurface(&PathBuf::from("step-1.compact"), &request);
-        let second = GeometryJob::isosurface(&PathBuf::from("step-2.compact"), &request);
+        let first = GeometryJob::isosurface(&PathBuf::from("step-1.msg"), &request);
+        let second = GeometryJob::isosurface(&PathBuf::from("step-2.msg"), &request);
         assert_ne!(first.key, second.key);
     }
 
@@ -575,7 +579,7 @@ mod tests {
             decimation: None,
             relaxation: None,
         };
-        let archive = PathBuf::from("step.compact");
+        let archive = PathBuf::from("step.msg");
 
         let regular = GeometryJob::isosurface(&archive, &request(false));
         let flipped = GeometryJob::isosurface(&archive, &request(true));
@@ -592,7 +596,7 @@ mod tests {
             decimation,
             relaxation: None,
         };
-        let archive = PathBuf::from("step.compact");
+        let archive = PathBuf::from("step.msg");
 
         let full = GeometryJob::isosurface(&archive, &request(None));
         let reduced =
@@ -610,7 +614,7 @@ mod tests {
             decimation: None,
             relaxation,
         };
-        let archive = PathBuf::from("step.compact");
+        let archive = PathBuf::from("step.msg");
         let relaxed = Relaxation {
             iterations: 3,
             lambda: 0.5,
@@ -638,20 +642,16 @@ mod tests {
     }
 
     #[test]
-    fn slice_plane_uses_the_unmodified_dataset_coordinate() {
-        let request = SliceRequest {
-            key: SliceKey::new("density", SliceAxis::Z, -12.5),
-            range: 0.0..=1.0,
-            colormap: None,
-            flip: false,
-            decimation: None,
-            relaxation: None,
-        };
-
-        let options = slice_options(&request, 7);
-
-        assert_eq!(options.plane.axis, SliceAxis::Z);
-        assert_eq!(options.plane.value, -12.5);
+    fn converts_physical_values_to_the_archive_logical_domain_without_clamping() {
+        let normalization = Some(MsgNormalization {
+            min: 100.0,
+            max: 500.0,
+        });
+        assert_eq!(logical_value(None, 300.0), 300.0);
+        assert_eq!(logical_value(normalization, 100.0), 0.0);
+        assert_eq!(logical_value(normalization, 300.0), 0.5);
+        assert_eq!(logical_value(normalization, 500.0), 1.0);
+        assert_eq!(logical_value(normalization, 600.0), 1.25);
     }
 
     #[test]
@@ -662,15 +662,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires TEPH_AMREX_ARCHIVE_DIR and performs real geometry extraction"]
+    #[ignore = "requires TEPH_MSG_ARCHIVE_DIR and performs real geometry extraction"]
     fn fulfills_colored_isosurface_from_external_archive() {
-        let directory = std::env::var("TEPH_AMREX_ARCHIVE_DIR").unwrap();
+        let directory = std::env::var("TEPH_MSG_ARCHIVE_DIR").unwrap();
         let timestep = discover_archive_timesteps(Path::new(&directory))
             .unwrap()
             .into_iter()
             .min_by_key(|timestep| std::fs::metadata(&timestep.archive_path).unwrap().len())
             .unwrap();
-        let variables = variables_from_compact(&timestep.archive_path).unwrap();
         let request = IsoRequest {
             key: IsoKey::new("E", 1.0e19),
             color: Some(ColorRequest {
@@ -684,13 +683,13 @@ mod tests {
         let job = GeometryJob::isosurface(&timestep.archive_path, &request);
         let mappings = Cache::builder()
             .max_capacity(MAPPED_ARCHIVE_CAPACITY_MIB)
-            .weigher(|_path: &PathBuf, mapping: &Arc<Mmap>| mapping_weight_mib(mapping.len()))
+            .weigher(|_path: &PathBuf, mapping: &Arc<MappedMsgArchive>| {
+                mapping_weight_mib(mapping.bytes().len())
+            })
             .build();
         let mapping = mapped_archive(&timestep.archive_path, &mappings).unwrap();
-        let component_ids = job.component_ids(&variables).unwrap();
-
-        let compact = read_compact_selected(&mapping, &component_ids).unwrap();
-        let mesh = build_geometry(&compact, &variables, &job).unwrap();
+        let archive = mapping.view().unwrap();
+        let mesh = build_geometry(&archive, &job).unwrap();
         assert_eq!(mesh.uv.len(), mesh.positions.len());
     }
 }

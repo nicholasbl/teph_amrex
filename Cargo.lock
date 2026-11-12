@@ -147,22 +147,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "amrex_rs"
-version = "0.5.0"
-source = "git+https://github.com/nicholasbl/amrex_rs.git?rev=bff0e971921ed58b7b2377c6564a873dd2a05680#bff0e971921ed58b7b2377c6564a873dd2a05680"
-dependencies = [
- "anyhow",
- "clap",
- "glam 0.33.12",
- "memmap2",
- "meshopt",
- "rayon",
- "rkyv",
- "serde",
- "toml",
-]
-
-[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3191,6 +3175,9 @@ name = "glam"
 version = "0.33.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37bfe73dc8ec21f54d181e5a60554327ec3f1c600c455a75ccbfc65d2106a6c4"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "glob"
@@ -4081,6 +4068,22 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "multires"
+version = "0.1.0"
+source = "git+https://github.com/nicholasbl/multires.git?rev=b94cd733361e3cf34107dccfa44ab7c51fefa5fd#b94cd733361e3cf34107dccfa44ab7c51fefa5fd"
+dependencies = [
+ "anyhow",
+ "clap",
+ "glam 0.33.12",
+ "memmap2",
+ "meshopt",
+ "rayon",
+ "rkyv",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -5872,14 +5875,13 @@ dependencies = [
 name = "teph_amrex"
 version = "0.1.0"
 dependencies = [
- "amrex_rs",
  "anyhow",
  "bevy",
  "bevy_fontmesh",
  "clap",
  "crossbeam-queue",
- "memmap2",
  "mini-moka",
+ "multires",
  "serde",
  "tephrite_rs",
  "toml",

@@ -1,21 +1,11 @@
 use std::{
-    collections::HashMap,
-    fs::{self, File},
+    collections::HashSet,
+    fs,
     path::{Path, PathBuf},
 };
 
-use amrex_rs::view_compact_unchecked;
-use anyhow::{Context, Result};
-use memmap2::Mmap;
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct PackedSidecar {
-    pub(crate) source: PathBuf,
-    pub(crate) simulation_time: f64,
-    pub(crate) variables: Vec<String>,
-    pub(crate) component_ids: Vec<u32>,
-}
+use anyhow::{Context, Result, ensure};
+use multires::{MappedMsgArchive, MsgArchive};
 
 #[derive(Debug, Clone)]
 pub(crate) struct TimestepInfo {
@@ -23,33 +13,34 @@ pub(crate) struct TimestepInfo {
     pub(crate) name: String,
     pub(crate) simulation_time: f64,
     pub(crate) domain: ([f64; 3], [f64; 3]),
-}
-
-pub(crate) fn discover_plotfiles(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() && path.join("Header").is_file() {
-            entries.push(path);
-        }
-    }
-    entries.sort();
-    Ok(entries)
+    pub(crate) fields: HashSet<String>,
 }
 
 pub(crate) fn discover_archive_timesteps(dir: &Path) -> Result<Vec<TimestepInfo>> {
     let mut timesteps = Vec::new();
+    let mut expected_fields: Option<HashSet<String>> = None;
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
-        if !matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("packed" | "compact")
-        ) {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("msg") {
             continue;
         }
-        let metadata = compact_metadata(&path)?;
+        let mapped = MappedMsgArchive::open(&path)
+            .with_context(|| format!("opening MSG timestep {}", path.display()))?;
+        let archive = mapped.view()?;
+        let fields = archive
+            .field_names()
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        if let Some(expected) = &expected_fields {
+            ensure!(
+                fields == *expected,
+                "MSG timestep {} has a different field set",
+                path.display()
+            );
+        } else {
+            expected_fields = Some(fields.clone());
+        }
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -58,8 +49,9 @@ pub(crate) fn discover_archive_timesteps(dir: &Path) -> Result<Vec<TimestepInfo>
         timesteps.push(TimestepInfo {
             archive_path: path,
             name,
-            simulation_time: metadata.simulation_time,
-            domain: metadata.domain,
+            simulation_time: archive.simulation_time(),
+            domain: archive_domain(&archive)?,
+            fields,
         });
     }
     timesteps.sort_by(|a, b| {
@@ -70,56 +62,47 @@ pub(crate) fn discover_archive_timesteps(dir: &Path) -> Result<Vec<TimestepInfo>
     Ok(timesteps)
 }
 
-pub(crate) fn variables_from_compact(path: &Path) -> Result<HashMap<String, u32>> {
-    let metadata = compact_metadata(path)?;
-    let mut variables = HashMap::new();
-    for id in metadata.component_ids {
-        let name = metadata
-            .variables
-            .get(&id)
-            .with_context(|| format!("component id {id} missing from archive variables"))?;
-        variables.insert(
-            name.clone(),
-            u32::try_from(id).context("component id does not fit in u32")?,
+fn archive_domain(archive: &MsgArchive<'_>) -> Result<([f64; 3], [f64; 3])> {
+    let matrix = archive.grid_to_world_columns();
+    let sample_offset = archive.geometry().sample_offset().to_array();
+    let mut minimum = [f64::INFINITY; 3];
+    let mut maximum = [f64::NEG_INFINITY; 3];
+    for level in archive.levels() {
+        ensure!(
+            level.point_extent.into_iter().all(|extent| extent > 0),
+            "MSG level has an empty point extent"
         );
+        for z in [0, level.point_extent[2] - 1] {
+            for y in [0, level.point_extent[1] - 1] {
+                for x in [0, level.point_extent[0] - 1] {
+                    let local = [f64::from(x), f64::from(y), f64::from(z)];
+                    let index = std::array::from_fn(|axis| {
+                        (f64::from(level.index_origin[axis]) + local[axis] + sample_offset[axis])
+                            * level.scale[axis]
+                    });
+                    let point = transform_point(matrix, index);
+                    for axis in 0..3 {
+                        minimum[axis] = minimum[axis].min(point[axis]);
+                        maximum[axis] = maximum[axis].max(point[axis]);
+                    }
+                }
+            }
+        }
     }
-    Ok(variables)
+    ensure!(
+        minimum.into_iter().chain(maximum).all(f64::is_finite),
+        "MSG archive has no finite level domain"
+    );
+    Ok((minimum, maximum))
 }
 
-struct CompactMetadata {
-    simulation_time: f64,
-    domain: ([f64; 3], [f64; 3]),
-    variables: HashMap<usize, String>,
-    component_ids: Vec<usize>,
-}
-
-fn compact_metadata(path: &Path) -> Result<CompactMetadata> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    // SAFETY: Archives discovered here are immutable files produced by amrex_rs.
-    // Mapping avoids reading multi-gigabyte archives merely to inspect metadata.
-    let mmap = unsafe { Mmap::map(&file) }
-        .with_context(|| format!("memory mapping {}", path.display()))?;
-    // SAFETY: The application only accepts amrex_rs compact archives. This API
-    // checks the archive envelope without traversing every grid and chunk.
-    let view = unsafe { view_compact_unchecked(&mmap) }
-        .with_context(|| format!("reading compact metadata from {}", path.display()))?;
-    Ok(CompactMetadata {
-        simulation_time: view.simulation_time(),
-        domain: view.domain(),
-        variables: view
-            .variables()
-            .map(|(name, index)| (index, name.to_string()))
-            .collect(),
-        component_ids: view.component_ids().collect(),
+fn transform_point(matrix: [f64; 16], point: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|row| {
+        matrix[row] * point[0]
+            + matrix[4 + row] * point[1]
+            + matrix[8 + row] * point[2]
+            + matrix[12 + row]
     })
-}
-
-pub(crate) fn packed_path_for_plotfile(plotfile: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.packed", plotfile.display()))
-}
-
-pub(crate) fn packed_sidecar_path(packed: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.toml", packed.display()))
 }
 
 #[cfg(test)]
@@ -127,9 +110,17 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires TEPH_AMREX_ARCHIVE_DIR to name an external archive directory"]
-    fn discovers_external_compact_archives() {
-        let directory = std::env::var("TEPH_AMREX_ARCHIVE_DIR").unwrap();
+    fn transforms_points_using_column_major_affine_matrices() {
+        let matrix = [
+            2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 10.0, 20.0, 30.0, 1.0,
+        ];
+        assert_eq!(transform_point(matrix, [1.0, 2.0, 3.0]), [12.0, 26.0, 42.0]);
+    }
+
+    #[test]
+    #[ignore = "requires TEPH_MSG_ARCHIVE_DIR to name an external archive directory"]
+    fn discovers_external_msg_archives() {
+        let directory = std::env::var("TEPH_MSG_ARCHIVE_DIR").unwrap();
         let timesteps = discover_archive_timesteps(Path::new(&directory)).unwrap();
         assert!(!timesteps.is_empty());
         assert!(
@@ -137,8 +128,6 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].simulation_time <= pair[1].simulation_time)
         );
-
-        let variables = variables_from_compact(&timesteps[0].archive_path).unwrap();
-        assert!(!variables.is_empty());
+        assert!(!timesteps[0].fields.is_empty());
     }
 }
