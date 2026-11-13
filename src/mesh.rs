@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use bevy::{
     asset::RenderAssetUsages,
     mesh::{Indices, PrimitiveTopology},
@@ -5,7 +7,16 @@ use bevy::{
 };
 use multires::Mesh3D;
 
-pub(crate) fn mesh3d_to_bevy_mesh(mesh: Mesh3D) -> (Option<Mesh>, u64) {
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MeshConversionTimings {
+    pub(crate) normals: Duration,
+    pub(crate) index_flatten: Duration,
+    pub(crate) mesh_build: Duration,
+    pub(crate) total: Duration,
+}
+
+pub(crate) fn mesh3d_to_bevy_mesh(mesh: Mesh3D) -> (Option<Mesh>, u64, MeshConversionTimings) {
+    let total_start = Instant::now();
     let vertex_count = mesh.positions.len();
     let estimated_bytes = mesh.positions.len() * std::mem::size_of::<[f32; 3]>()
         + mesh.positions.len() * std::mem::size_of::<[f32; 3]>()
@@ -13,17 +24,31 @@ pub(crate) fn mesh3d_to_bevy_mesh(mesh: Mesh3D) -> (Option<Mesh>, u64) {
         + mesh.indices.len() * std::mem::size_of::<[u32; 3]>();
     let positions = mesh.positions;
     let uv = mesh.uv;
+    let stage_start = Instant::now();
     let normals = equal_weighted_vertex_normals(&positions, &mesh.indices);
+    let normals_time = stage_start.elapsed();
 
+    let stage_start = Instant::now();
     let indices = mesh.indices.into_boxed_slice().as_flattened().to_vec();
+    let index_flatten = stage_start.elapsed();
 
     // Bevy 0.19's mesh allocator emits a misleading slab use-after-free error
     // for empty meshes. Empty extraction results are valid (for example, an
     // isovalue absent from a timestep), but they must not become render assets.
     if positions.is_empty() || indices.is_empty() {
-        return (None, estimated_bytes as u64);
+        return (
+            None,
+            estimated_bytes as u64,
+            MeshConversionTimings {
+                normals: normals_time,
+                index_flatten,
+                total: total_start.elapsed(),
+                ..Default::default()
+            },
+        );
     }
 
+    let stage_start = Instant::now();
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
@@ -42,7 +67,16 @@ pub(crate) fn mesh3d_to_bevy_mesh(mesh: Mesh3D) -> (Option<Mesh>, u64) {
         );
     }
 
-    (Some(mesh), estimated_bytes as u64)
+    (
+        Some(mesh),
+        estimated_bytes as u64,
+        MeshConversionTimings {
+            normals: normals_time,
+            index_flatten,
+            mesh_build: stage_start.elapsed(),
+            total: total_start.elapsed(),
+        },
+    )
 }
 
 // We use our own as bevy's normal compute does WEIRD things.
@@ -88,7 +122,7 @@ mod tests {
 
     #[test]
     fn empty_geometry_does_not_create_a_bevy_mesh() {
-        let (mesh, estimated_bytes) = mesh3d_to_bevy_mesh(Mesh3D::default());
+        let (mesh, estimated_bytes, _) = mesh3d_to_bevy_mesh(Mesh3D::default());
 
         assert!(mesh.is_none());
         assert_eq!(estimated_bytes, 0);
@@ -96,7 +130,7 @@ mod tests {
 
     #[test]
     fn geometry_without_faces_does_not_create_a_bevy_mesh() {
-        let (mesh, _) = mesh3d_to_bevy_mesh(Mesh3D {
+        let (mesh, _, _) = mesh3d_to_bevy_mesh(Mesh3D {
             positions: vec![[0.0, 0.0, 0.0]],
             uv: vec![[0.0, 0.0]],
             indices: Vec::new(),

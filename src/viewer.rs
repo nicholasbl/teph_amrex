@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    time::Instant,
 };
 
 use anyhow::{Result, ensure};
@@ -55,6 +56,7 @@ struct ColorMapChoice {
 
 struct PendingState {
     generation: u64,
+    requested_at: Instant,
     required: Vec<GeometryKey>,
     meshes: HashMap<GeometryKey, CachedMesh>,
     complete: bool,
@@ -950,6 +952,7 @@ fn remove_slice_request(
 }
 
 fn request_fulfillment(commands: &mut Commands, state: &mut ViewerState, root: Entity) {
+    let requested_at = Instant::now();
     let Some(archive_path) = state
         .timesteps
         .get(state.current)
@@ -978,6 +981,7 @@ fn request_fulfillment(commands: &mut Commands, state: &mut ViewerState, root: E
     let complete = missing.is_empty();
     state.pending = Some(PendingState {
         generation,
+        requested_at,
         required,
         meshes: ready,
         complete,
@@ -993,6 +997,7 @@ fn request_fulfillment(commands: &mut Commands, state: &mut ViewerState, root: E
             generation,
             archive_path,
             jobs: missing,
+            submitted_at: requested_at,
         });
     }
 }
@@ -1035,10 +1040,16 @@ fn poll_fulfillment_results(
                     info!("Geometry ready with no triangles; skipping render asset");
                 }
 
+                let asset_start = Instant::now();
                 let cached = CachedMesh {
                     handle: mesh.map(|mesh| meshes.add(mesh)),
                     estimated_bytes,
                 };
+                info!(
+                    "viewer timing: key {:?}, asset_insertion {:.6}s",
+                    key,
+                    asset_start.elapsed().as_secs_f64(),
+                );
                 state.mesh_cache.insert(key.clone(), cached.clone());
                 if let Some(pending) = state.pending.as_mut()
                     && pending.required.contains(&key)
@@ -1092,6 +1103,8 @@ fn commit_pending(commands: &mut Commands, state: &mut ViewerState, root: Entity
         info!("break 1");
         return;
     };
+    let generation = pending.generation;
+    let requested_at = pending.requested_at;
 
     if !pending.complete
         || !pending
@@ -1169,6 +1182,11 @@ fn commit_pending(commands: &mut Commands, state: &mut ViewerState, root: Entity
     info!(
         "showing fulfilled timestep {} ({})",
         state.current, state.timesteps[state.current].name
+    );
+    info!(
+        "viewer timing: generation {} request_to_scene_commit {:.6}s",
+        generation,
+        requested_at.elapsed().as_secs_f64(),
     );
 }
 

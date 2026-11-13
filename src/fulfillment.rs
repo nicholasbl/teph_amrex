@@ -2,7 +2,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
     thread::{self, Thread},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -165,6 +165,7 @@ pub(crate) struct FulfillmentRequest {
     pub(crate) generation: u64,
     pub(crate) archive_path: PathBuf,
     pub(crate) jobs: Vec<GeometryJob>,
+    pub(crate) submitted_at: Instant,
 }
 
 pub(crate) enum FulfillmentResult {
@@ -258,14 +259,29 @@ fn fulfill_request(
         return WorkOutcome::Superseded(next);
     }
 
+    let batch_start = Instant::now();
+    let queue_wait = batch_start.duration_since(request.submitted_at);
     let result = (|| -> Result<()> {
         if request.jobs.is_empty() {
             return Ok(());
         }
-        let mapping = mapped_archive(&request.archive_path, mappings)?;
+        let stage_start = Instant::now();
+        let (mapping, mapping_cached) = mapped_archive(&request.archive_path, mappings)?;
+        let mapping_time = stage_start.elapsed();
+        let stage_start = Instant::now();
         let archive = mapping
             .view()
             .with_context(|| format!("reading MSG archive {}", request.archive_path.display()))?;
+        let view_time = stage_start.elapsed();
+        info!(
+            "fulfillment timings: generation {}, queue_wait {:.6}s, archive_mapping {:.6}s (cached {}), archive_view_validation {:.6}s, jobs {}",
+            request.generation,
+            queue_wait.as_secs_f64(),
+            mapping_time.as_secs_f64(),
+            mapping_cached,
+            view_time.as_secs_f64(),
+            request.jobs.len(),
+        );
 
         for job in &request.jobs {
             // Leave the replacement in the queue for the handoff below. There
@@ -274,8 +290,20 @@ fn fulfill_request(
             if !requests.is_empty() {
                 return Ok(());
             }
+            let job_start = Instant::now();
             let mesh = build_geometry(&archive, job)?;
-            let (mesh, estimated_bytes) = mesh3d_to_bevy_mesh(mesh);
+            let build_time = job_start.elapsed();
+            let (mesh, estimated_bytes, conversion) = mesh3d_to_bevy_mesh(mesh);
+            info!(
+                "geometry timings: key {:?}, build {:.6}s, normals {:.6}s, index_flatten {:.6}s, bevy_mesh_build {:.6}s, conversion_total {:.6}s, worker_job_total {:.6}s",
+                job.key,
+                build_time.as_secs_f64(),
+                conversion.normals.as_secs_f64(),
+                conversion.index_flatten.as_secs_f64(),
+                conversion.mesh_build.as_secs_f64(),
+                conversion.total.as_secs_f64(),
+                job_start.elapsed().as_secs_f64(),
+            );
             push_result(
                 results,
                 FulfillmentResult::GeometryReady {
@@ -292,12 +320,19 @@ fn fulfill_request(
         return WorkOutcome::Superseded(next);
     }
     match result {
-        Ok(()) => push_result(
-            results,
-            FulfillmentResult::Complete {
-                generation: request.generation,
-            },
-        ),
+        Ok(()) => {
+            info!(
+                "fulfillment timings: generation {} worker_batch_total {:.6}s",
+                request.generation,
+                batch_start.elapsed().as_secs_f64(),
+            );
+            push_result(
+                results,
+                FulfillmentResult::Complete {
+                    generation: request.generation,
+                },
+            )
+        }
         Err(error) => push_result(
             results,
             FulfillmentResult::Failed {
@@ -312,17 +347,18 @@ fn fulfill_request(
 fn mapped_archive(
     path: &PathBuf,
     mappings: &Cache<PathBuf, Arc<MappedMsgArchive>>,
-) -> Result<Arc<MappedMsgArchive>> {
+) -> Result<(Arc<MappedMsgArchive>, bool)> {
     if let Some(mapping) = mappings.get(path) {
-        return Ok(mapping);
+        return Ok((mapping, true));
     }
     let mapping = Arc::new(MappedMsgArchive::open(path)?);
     mappings.insert(path.clone(), Arc::clone(&mapping));
-    Ok(mapping)
+    Ok((mapping, false))
 }
 
 fn build_geometry(archive: &MsgArchive<'_>, job: &GeometryJob) -> Result<Mesh3D> {
-    info!("Building geometry");
+    let total_start = Instant::now();
+    let extraction_start = Instant::now();
     let (mut mesh, decimation, relaxation) = match &job.request {
         GeometryRequest::Isosurface(request) => {
             let sampled_quantities = request
@@ -340,7 +376,7 @@ fn build_geometry(archive: &MsgArchive<'_>, job: &GeometryJob) -> Result<Mesh3D>
                 })
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
-            let (mesh, _timings) = isosurface_archive(
+            let (mesh, timings) = isosurface_archive(
                 archive,
                 IsosurfaceOptions {
                     surface: Surface {
@@ -356,6 +392,40 @@ fn build_geometry(archive: &MsgArchive<'_>, job: &GeometryJob) -> Result<Mesh3D>
                     flip_winding: request.flip,
                 },
             )?;
+            let mesh_generation = timings
+                .per_level
+                .iter()
+                .map(|level| level.mesh_generation_time)
+                .sum::<Duration>();
+            let merge = timings
+                .per_level
+                .iter()
+                .map(|level| level.merge_time)
+                .sum::<Duration>();
+            let winding = timings
+                .per_level
+                .iter()
+                .map(|level| level.winding_time)
+                .sum::<Duration>();
+            info!(
+                "isosurface timings: key {:?}, preparation {:.6}s, level_mesh_generation {:.6}s, level_merge {:.6}s, winding {:.6}s, levels {}",
+                job.key,
+                timings.preparation.as_secs_f64(),
+                mesh_generation.as_secs_f64(),
+                merge.as_secs_f64(),
+                winding.as_secs_f64(),
+                timings.per_level.len(),
+            );
+            for (level, timing) in timings.per_level.iter().enumerate() {
+                info!(
+                    "isosurface level timing: key {:?}, level {}, mesh_generation {:.6}s, merge {:.6}s, winding {:.6}s",
+                    job.key,
+                    level,
+                    timing.mesh_generation_time.as_secs_f64(),
+                    timing.merge_time.as_secs_f64(),
+                    timing.winding_time.as_secs_f64(),
+                );
+            }
             (
                 mesh,
                 request.decimation.as_ref(),
@@ -368,18 +438,32 @@ fn build_geometry(archive: &MsgArchive<'_>, job: &GeometryJob) -> Result<Mesh3D>
             request.relaxation.as_ref(),
         ),
     };
+    let extraction_time = extraction_start.elapsed();
 
+    let stage_start = Instant::now();
     if let Some(decimation) = decimation {
         info!("Decimating mesh before: {}", mesh.positions.len());
         decimate_geometry(&mut mesh, decimation)?;
         info!("Decimating mesh after: {}", mesh.positions.len());
     }
+    let decimation_time = stage_start.elapsed();
 
+    let stage_start = Instant::now();
     if let Some(relaxation) = relaxation {
         relax_geometry(&mut mesh, relaxation)?;
     }
+    let relaxation_time = stage_start.elapsed();
 
-    info!("Built mesh, size {}", mesh.positions.len());
+    info!(
+        "mesh build timings: key {:?}, extraction {:.6}s, decimation {:.6}s, relaxation {:.6}s, total {:.6}s, vertices {}, faces {}",
+        job.key,
+        extraction_time.as_secs_f64(),
+        decimation_time.as_secs_f64(),
+        relaxation_time.as_secs_f64(),
+        total_start.elapsed().as_secs_f64(),
+        mesh.positions.len(),
+        mesh.indices.len(),
+    );
 
     Ok(mesh)
 }
@@ -423,6 +507,7 @@ fn decimate_geometry(mesh: &mut Mesh3D, decimation: &Decimation) -> Result<()> {
         DecimatePipelineOptions {
             decimate: DecimateOptions {
                 target,
+                parallel: None,
                 ..DecimateOptions::default()
             },
             ..DecimatePipelineOptions::default()
@@ -687,7 +772,7 @@ mod tests {
                 mapping_weight_mib(mapping.bytes().len())
             })
             .build();
-        let mapping = mapped_archive(&timestep.archive_path, &mappings).unwrap();
+        let (mapping, _) = mapped_archive(&timestep.archive_path, &mappings).unwrap();
         let archive = mapping.view().unwrap();
         let mesh = build_geometry(&archive, &job).unwrap();
         assert_eq!(mesh.uv.len(), mesh.positions.len());
