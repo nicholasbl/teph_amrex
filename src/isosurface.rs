@@ -461,6 +461,19 @@ mod tests {
     }
 
     #[test]
+    fn example_config_is_valid() {
+        let config: DirectoryConfig =
+            toml::from_str(include_str!("../teph_amrex.example.toml")).unwrap();
+
+        assert_eq!(config.isosurfaces.len(), 2);
+        assert_eq!(config.slices.len(), 1);
+        parse_decimation(config.decimation.as_ref().unwrap()).unwrap();
+        parse_relaxation(config.relax.as_ref().unwrap()).unwrap();
+        parse_decimation(config.isosurfaces[1].decimation.as_ref().unwrap()).unwrap();
+        parse_relaxation(config.isosurfaces[1].relax.as_ref().unwrap()).unwrap();
+    }
+
+    #[test]
     fn parses_isosurface_command_without_flip() {
         let request = parse_isosurface_command("density 0.5", &fields()).unwrap();
         assert_eq!(request.key.quantity, "density");

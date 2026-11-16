@@ -1,0 +1,54 @@
+# Copy this file to <data-directory>/teph_amrex.toml. teph_amrex loads it
+# automatically when started with that data directory:
+#
+#   cp teph_amrex.example.toml /path/to/data/teph_amrex.toml
+#   cargo run --release -- /path/to/data
+#
+# Quantity names and numeric values below are examples; replace them with fields
+# and ranges present in your dataset.
+
+# Built-in colormaps may be named by stem or filename (for example, "vik" or
+# "vik.png"). An absolute path to a PNG, JPEG, or EXR image also works.
+colormap = "vik"
+slice_colormap = "lajolla"
+
+# These defaults apply to every isosurface and slice unless overridden on that
+# entry. Decimation accepts exactly one of `percentage` (in (0, 100]) or a
+# positive `triangles` count. Omit `decimation` to keep the original mesh.
+decimation = { percentage = 25.0 }
+
+# All relaxation fields are optional. Omitted fields use the multires library
+# defaults. lambda must be in [0, 1], mu in [-1, 0], and max_step_ratio >= 0.
+# Omit `relax` entirely to disable relaxation.
+relax = { iterations = 4, lambda = 0.5, mu = -0.53, max_step_ratio = 0.1, lock_boundaries = true }
+
+# Create an isosurface for `density = 0.5` and color it using `temperature`.
+# color_by, color_min, and color_max must either all be present or all omitted.
+[[isosurfaces]]
+quantity = "density"
+value = 0.5
+color_by = "temperature"
+color_min = 250.0
+color_max = 2000.0
+flip = false
+
+# Additional entries create additional surfaces. Per-entry decimation and relax
+# settings override the top-level defaults.
+[[isosurfaces]]
+quantity = "temperature"
+value = 1000.0
+flip = true
+decimation = { triangles = 50000 }
+relax = { iterations = 2, lock_boundaries = false }
+
+# Slice axes are x, y, or z. `min` and `max` are optional, but must be supplied
+# together; when omitted, the viewer chooses the sample range. A slice may also
+# override the default slice colormap.
+[[slices]]
+quantity = "temperature"
+axis = "z"
+value = 0.0
+min = 250.0
+max = 2000.0
+colormap = "lipari"
+flip = false
