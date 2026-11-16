@@ -26,9 +26,9 @@ use crate::{
         FulfillmentRequest, FulfillmentResult, FulfillmentWorker, GeometryJob, GeometryKey,
     },
     isosurface::{
-        Decimation, DomainBoxes, Infographic, IsoKey, IsoRequest, Relaxation, SliceKey,
-        SliceRequest, load_initial_requests, parse_isosurface_command, parse_slice_command,
-        slice_axis_label,
+        Decimation, DomainGuide, DomainGuideAxis, DomainGuidePlacement, Infographic, IsoKey,
+        IsoRequest, Relaxation, SliceKey, SliceRequest, load_initial_requests,
+        parse_isosurface_command, parse_slice_command, slice_axis_label,
     },
 };
 
@@ -372,7 +372,7 @@ fn setup_inner(
         root,
         domain,
         geometry_transform,
-        requests.domain_boxes.as_ref(),
+        &requests.domain_guides,
         requests.infographic.as_ref(),
     )?;
 
@@ -491,18 +491,18 @@ fn setup_visual_aids(
     root: Entity,
     domain: ([f64; 3], [f64; 3]),
     geometry_transform: Transform,
-    domain_boxes: Option<&DomainBoxes>,
+    domain_guides: &[DomainGuide],
     infographic: Option<&Infographic>,
 ) -> Result<()> {
-    if let Some(config) = domain_boxes {
-        spawn_domain_boxes(
+    if !domain_guides.is_empty() {
+        spawn_domain_guides(
             commands,
             materials,
             meshes,
             root,
             domain,
             geometry_transform,
-            config,
+            domain_guides,
         )?;
     }
     if let Some(config) = infographic {
@@ -520,48 +520,19 @@ fn setup_visual_aids(
     Ok(())
 }
 
-fn spawn_domain_boxes(
+fn spawn_domain_guides(
     commands: &mut Commands,
     materials: &mut Assets<StandardMaterial>,
     meshes: &mut Assets<Mesh>,
     root: Entity,
     (min, max): ([f64; 3], [f64; 3]),
     geometry_transform: Transform,
-    config: &DomainBoxes,
+    guides: &[DomainGuide],
 ) -> Result<()> {
-    let extent = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
-    ensure!(
-        extent[0] > 0.0 && extent[1] > 0.0,
-        "domain boxes require positive x and y extents"
-    );
-    let longest_extent = extent.into_iter().fold(0.0_f64, f64::max);
-    let thickness = config.thickness.unwrap_or(longest_extent * 0.01);
-    ensure!(
-        extent[0] as f32 > 0.0
-            && (extent[0] as f32).is_finite()
-            && extent[1] as f32 > 0.0
-            && (extent[1] as f32).is_finite()
-            && thickness as f32 > 0.0
-            && (thickness as f32).is_finite(),
-        "domain box dimensions cannot be represented"
-    );
-    let mesh = meshes.add(Cuboid::new(
-        extent[0] as f32,
-        extent[1] as f32,
-        thickness as f32,
-    ));
-    let center_x = ((min[0] + max[0]) * 0.5) as f32;
-    let center_y = ((min[1] + max[1]) * 0.5) as f32;
-    let locations = [
-        (
-            "Bottom Domain Box",
-            min[2] - thickness * 0.5,
-            config.bottom_color,
-        ),
-        ("Top Domain Box", max[2] + thickness * 0.5, config.top_color),
-    ];
-
-    for (name, z, color) in locations {
+    for (index, guide) in guides.iter().enumerate() {
+        let (dimensions, center, thickness) = domain_guide_geometry(min, max, guide)?;
+        let mesh = meshes.add(Cuboid::new(dimensions[0], dimensions[1], dimensions[2]));
+        let color = guide.color;
         let material = materials.add(StandardMaterial {
             base_color: Color::srgba(color[0], color[1], color[2], color[3]),
             alpha_mode: if color[3] < 1.0 {
@@ -572,17 +543,63 @@ fn spawn_domain_boxes(
             perceptual_roughness: 0.8,
             ..default()
         });
-        let local = Transform::from_xyz(center_x, center_y, z as f32);
+        let local = Transform::from_xyz(center[0], center[1], center[2]);
         commands.spawn((
-            Name::new(name),
-            Mesh3d(mesh.clone()),
+            Name::new(format!("Domain Guide {index}")),
+            Mesh3d(mesh),
             MeshMaterial3d(material),
             geometry_transform.mul_transform(local),
             ChildOf(root),
             NotShadowCaster,
         ));
+        info!(
+            "spawned domain guide {index}: axis {:?}, placement {:?}, thickness {}, color {:?}",
+            guide.axis, guide.placement, thickness, guide.color,
+        );
     }
     Ok(())
+}
+
+fn domain_guide_geometry(
+    min: [f64; 3],
+    max: [f64; 3],
+    guide: &DomainGuide,
+) -> Result<([f32; 3], [f32; 3], f64)> {
+    let extent = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    let longest_extent = extent.into_iter().fold(0.0_f64, f64::max);
+    let axis = match guide.axis {
+        DomainGuideAxis::X => 0,
+        DomainGuideAxis::Y => 1,
+        DomainGuideAxis::Z => 2,
+    };
+    let thickness = guide.thickness.unwrap_or(longest_extent * 0.01);
+    let mut dimensions = extent;
+    dimensions[axis] = thickness;
+    ensure!(
+        dimensions
+            .into_iter()
+            .all(|dimension| dimension as f32 > 0.0 && (dimension as f32).is_finite()),
+        "domain guide dimensions cannot be represented"
+    );
+    let mut center = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+    center[axis] = match guide.placement {
+        DomainGuidePlacement::Min => min[axis] - thickness * 0.5,
+        DomainGuidePlacement::Max => max[axis] + thickness * 0.5,
+        DomainGuidePlacement::Value(value) => value,
+    };
+    ensure!(
+        center.into_iter().all(|value| (value as f32).is_finite()),
+        "domain guide position cannot be represented"
+    );
+    Ok((
+        dimensions.map(|dimension| dimension as f32),
+        center.map(|value| value as f32),
+        thickness,
+    ))
 }
 
 fn spawn_infographic(
@@ -1404,6 +1421,8 @@ fn commit_pending(commands: &mut Commands, state: &mut ViewerState, root: Entity
             commands
                 .entity(new)
                 .insert((NotShadowCaster, NotShadowReceiver));
+        } else {
+            commands.entity(new).insert(NotShadowReceiver);
         }
 
         entities.push(new);
@@ -1544,6 +1563,22 @@ mod tests {
         assert_eq!(mesh_weight_mib(1), 1);
         assert_eq!(mesh_weight_mib(MIB), 1);
         assert_eq!(mesh_weight_mib(MIB + 1), 2);
+    }
+
+    #[test]
+    fn y_boundary_guides_span_xz_and_sit_outside_the_domain() {
+        let guide = DomainGuide {
+            axis: DomainGuideAxis::Y,
+            placement: DomainGuidePlacement::Min,
+            thickness: Some(0.2),
+            color: [1.0; 4],
+        };
+        let (dimensions, center, thickness) =
+            domain_guide_geometry([-2.0, -1.0, -3.0], [2.0, 5.0, 7.0], &guide).unwrap();
+
+        assert_eq!(dimensions, [4.0, 0.2, 10.0]);
+        assert_eq!(center, [0.0, -1.1, 2.0]);
+        assert_eq!(thickness, 0.2);
     }
 
     #[test]

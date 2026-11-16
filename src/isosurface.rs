@@ -24,18 +24,25 @@ struct DirectoryConfig {
     isosurfaces: Vec<ConfigIsosurface>,
     #[serde(default)]
     slices: Vec<ConfigSlice>,
-    domain_boxes: Option<ConfigDomainBoxes>,
+    #[serde(default)]
+    domain_guides: Vec<ConfigDomainGuide>,
     infographic: Option<ConfigInfographic>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ConfigDomainBoxes {
-    #[serde(default)]
+struct ConfigDomainGuide {
+    #[serde(default = "enabled_by_default")]
     enabled: bool,
+    axis: String,
+    side: Option<String>,
+    value: Option<f64>,
     thickness: Option<f64>,
-    top_color: Option<[f64; 4]>,
-    bottom_color: Option<[f64; 4]>,
+    color: Option<[f64; 4]>,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,15 +203,30 @@ pub(crate) struct InitialRequests {
     pub(crate) relaxation: Option<Relaxation>,
     pub(crate) isosurfaces: Vec<IsoRequest>,
     pub(crate) slices: Vec<SliceRequest>,
-    pub(crate) domain_boxes: Option<DomainBoxes>,
+    pub(crate) domain_guides: Vec<DomainGuide>,
     pub(crate) infographic: Option<Infographic>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DomainBoxes {
+pub(crate) struct DomainGuide {
+    pub(crate) axis: DomainGuideAxis,
+    pub(crate) placement: DomainGuidePlacement,
     pub(crate) thickness: Option<f64>,
-    pub(crate) top_color: [f32; 4],
-    pub(crate) bottom_color: [f32; 4],
+    pub(crate) color: [f32; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DomainGuideAxis {
+    X,
+    Y,
+    Z,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum DomainGuidePlacement {
+    Min,
+    Max,
+    Value(f64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -298,12 +320,12 @@ pub(crate) fn load_initial_requests(
         .map(parse_decimation)
         .transpose()?;
     let default_relaxation = config.relax.as_ref().map(parse_relaxation).transpose()?;
-    let domain_boxes = config
-        .domain_boxes
-        .as_ref()
-        .filter(|boxes| boxes.enabled)
-        .map(parse_domain_boxes)
-        .transpose()?;
+    let domain_guides = config
+        .domain_guides
+        .iter()
+        .filter(|guide| guide.enabled)
+        .map(parse_domain_guide)
+        .collect::<Result<Vec<_>>>()?;
     let infographic = config
         .infographic
         .as_ref()
@@ -429,22 +451,40 @@ pub(crate) fn load_initial_requests(
         relaxation: default_relaxation,
         isosurfaces,
         slices,
-        domain_boxes,
+        domain_guides,
         infographic,
     })
 }
 
-fn parse_domain_boxes(config: &ConfigDomainBoxes) -> Result<DomainBoxes> {
+fn parse_domain_guide(config: &ConfigDomainGuide) -> Result<DomainGuide> {
+    let axis = match config.axis.to_ascii_lowercase().as_str() {
+        "x" => DomainGuideAxis::X,
+        "y" => DomainGuideAxis::Y,
+        "z" => DomainGuideAxis::Z,
+        _ => bail!("domain guide axis must be x, y, or z"),
+    };
+    let placement = match (config.side.as_deref(), config.value) {
+        (Some(side), None) if side.eq_ignore_ascii_case("min") => DomainGuidePlacement::Min,
+        (Some(side), None) if side.eq_ignore_ascii_case("max") => DomainGuidePlacement::Max,
+        (Some(side), None) => bail!("domain guide side {side:?} must be min or max"),
+        (None, Some(value)) => {
+            ensure!(value.is_finite(), "domain guide value must be finite");
+            DomainGuidePlacement::Value(value)
+        }
+        (Some(_), Some(_)) => bail!("domain guide requires side or value, not both"),
+        (None, None) => bail!("domain guide requires either side or value"),
+    };
     if let Some(thickness) = config.thickness {
         ensure!(
             thickness.is_finite() && thickness > 0.0,
-            "domain box thickness must be finite and positive"
+            "domain guide thickness must be finite and positive"
         );
     }
-    Ok(DomainBoxes {
+    Ok(DomainGuide {
+        axis,
+        placement,
         thickness: config.thickness,
-        top_color: parse_rgba(config.top_color.unwrap_or([0.2, 0.55, 0.95, 0.35]))?,
-        bottom_color: parse_rgba(config.bottom_color.unwrap_or([0.95, 0.35, 0.15, 0.35]))?,
+        color: parse_rgba(config.color.unwrap_or([0.2, 0.55, 0.95, 0.35]))?,
     })
 }
 
@@ -491,7 +531,7 @@ fn parse_rgba(color: [f64; 4]) -> Result<[f32; 4]> {
         color
             .into_iter()
             .all(|channel| channel.is_finite() && (0.0..=1.0).contains(&channel)),
-        "domain box RGBA channels must be finite and in [0, 1]"
+        "domain guide RGBA channels must be finite and in [0, 1]"
     );
     Ok(color.map(|channel| channel as f32))
 }
@@ -622,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_domain_boxes_and_world_space_infographic() {
+    fn loads_domain_guides_and_world_space_infographic() {
         let directory = std::env::temp_dir().join(format!(
             "teph_amrex_visual_aids_config_{}",
             std::process::id()
@@ -632,11 +672,21 @@ mod tests {
         fs::write(
             directory.join(CONFIG_FILE),
             r#"
-                [domain_boxes]
-                enabled = true
+                [[domain_guides]]
+                axis = "y"
+                side = "min"
                 thickness = 0.25
-                top_color = [0.1, 0.2, 0.3, 0.4]
-                bottom_color = [0.5, 0.6, 0.7, 0.8]
+                color = [0.1, 0.2, 0.3, 0.4]
+
+                [[domain_guides]]
+                axis = "x"
+                value = 2.5
+                color = [0.5, 0.6, 0.7, 0.8]
+
+                [[domain_guides]]
+                enabled = false
+                axis = "z"
+                side = "max"
 
                 [infographic]
                 enabled = true
@@ -649,10 +699,16 @@ mod tests {
         .unwrap();
 
         let requests = load_initial_requests(&directory, &fields()).unwrap();
-        let boxes = requests.domain_boxes.unwrap();
-        assert_eq!(boxes.thickness, Some(0.25));
-        assert_eq!(boxes.top_color, [0.1, 0.2, 0.3, 0.4]);
-        assert_eq!(boxes.bottom_color, [0.5, 0.6, 0.7, 0.8]);
+        assert_eq!(requests.domain_guides.len(), 2);
+        let first = &requests.domain_guides[0];
+        assert_eq!(first.axis, DomainGuideAxis::Y);
+        assert_eq!(first.placement, DomainGuidePlacement::Min);
+        assert_eq!(first.thickness, Some(0.25));
+        assert_eq!(first.color, [0.1, 0.2, 0.3, 0.4]);
+        let second = &requests.domain_guides[1];
+        assert_eq!(second.axis, DomainGuideAxis::X);
+        assert_eq!(second.placement, DomainGuidePlacement::Value(2.5));
+        assert_eq!(second.color, [0.5, 0.6, 0.7, 0.8]);
         let infographic = requests.infographic.unwrap();
         assert_eq!(infographic.image, directory.join("poster.png"));
         assert_eq!(infographic.position, [1.0, 2.0, 3.0]);
@@ -667,20 +723,35 @@ mod tests {
     #[test]
     fn rejects_invalid_visual_aid_values() {
         assert!(
-            parse_domain_boxes(&ConfigDomainBoxes {
+            parse_domain_guide(&ConfigDomainGuide {
                 enabled: true,
+                axis: "y".into(),
+                side: Some("min".into()),
+                value: None,
                 thickness: Some(0.0),
-                top_color: None,
-                bottom_color: None,
+                color: None,
             })
             .is_err()
         );
         assert!(
-            parse_domain_boxes(&ConfigDomainBoxes {
+            parse_domain_guide(&ConfigDomainGuide {
                 enabled: true,
+                axis: "y".into(),
+                side: None,
+                value: Some(0.0),
                 thickness: None,
-                top_color: Some([1.1, 0.0, 0.0, 1.0]),
-                bottom_color: None,
+                color: Some([1.1, 0.0, 0.0, 1.0]),
+            })
+            .is_err()
+        );
+        assert!(
+            parse_domain_guide(&ConfigDomainGuide {
+                enabled: true,
+                axis: "q".into(),
+                side: Some("max".into()),
+                value: None,
+                thickness: None,
+                color: None,
             })
             .is_err()
         );
