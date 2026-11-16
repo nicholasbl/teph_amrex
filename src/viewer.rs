@@ -19,15 +19,16 @@ use tephrite_rs::{prelude::*, remote_control::common::PropertyValue};
 use crate::{
     colormap::{
         BUILTIN_COLORMAP_DIR, ColorMapSelection, discover_builtin_colormaps, load_colormap_image,
-        select_colormap,
+        load_infographic_image, select_colormap,
     },
     discovery::{TimestepInfo, discover_archive_timesteps},
     fulfillment::{
         FulfillmentRequest, FulfillmentResult, FulfillmentWorker, GeometryJob, GeometryKey,
     },
     isosurface::{
-        Decimation, IsoKey, IsoRequest, Relaxation, SliceKey, SliceRequest, load_initial_requests,
-        parse_isosurface_command, parse_slice_command, slice_axis_label,
+        Decimation, DomainBoxes, Infographic, IsoKey, IsoRequest, Relaxation, SliceKey,
+        SliceRequest, load_initial_requests, parse_isosurface_command, parse_slice_command,
+        slice_axis_label,
     },
 };
 
@@ -54,6 +55,27 @@ struct ColorMapChoice {
     image: Handle<Image>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SurfaceStyle {
+    alpha_bits: u32,
+    transmission_bits: u32,
+}
+
+impl From<&IsoRequest> for SurfaceStyle {
+    fn from(request: &IsoRequest) -> Self {
+        Self {
+            alpha_bits: request.alpha.to_bits(),
+            transmission_bits: request.transmission.to_bits(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SurfaceMaterials {
+    plain: Handle<StandardMaterial>,
+    colored: Handle<StandardMaterial>,
+}
+
 struct PendingState {
     generation: u64,
     requested_at: Instant,
@@ -73,6 +95,7 @@ struct ViewerState {
     delete_slice_controls: HashMap<SliceKey, Entity>,
     isosurface_material: Handle<StandardMaterial>,
     colored_isosurface_material: Handle<StandardMaterial>,
+    isosurface_material_overrides: HashMap<SurfaceStyle, SurfaceMaterials>,
     colormaps: Vec<ColorMapChoice>,
     slice_colormap_indices: HashMap<String, usize>,
     current_colormap: usize,
@@ -222,22 +245,17 @@ fn setup_inner(
         domain, geometry_transform
     );
 
-    let isosurface_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.2, 0.72, 0.86),
-        perceptual_roughness: 0.55,
-        metallic: 0.0,
-        //unlit: true,
-        //cull_mode: None,
-        //double_sided: true,
-        ..Default::default()
-    });
-    let colored_isosurface_material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        base_color_texture: Some(colormaps[current_colormap].image.clone()),
-        perceptual_roughness: 0.55,
-        metallic: 0.0,
-        ..Default::default()
-    });
+    let isosurface_material = materials.add(make_isosurface_material(None, 1.0, 0.0));
+    let colored_isosurface_material = materials.add(make_isosurface_material(
+        Some(colormaps[current_colormap].image.clone()),
+        1.0,
+        0.0,
+    ));
+    let isosurface_material_overrides = build_isosurface_material_overrides(
+        &requests.isosurfaces,
+        &colormaps[current_colormap].image,
+        materials,
+    );
     let slice_material = materials.add(StandardMaterial {
         //base_color: Color::srgba(1.0, 1.0, 1.0, 0.72),
         base_color_texture: Some(colormaps[current_slice_colormap].image.clone()),
@@ -324,6 +342,7 @@ fn setup_inner(
         delete_slice_controls: HashMap::new(),
         isosurface_material,
         colored_isosurface_material,
+        isosurface_material_overrides,
         colormaps,
         slice_colormap_indices,
         current_colormap,
@@ -345,6 +364,17 @@ fn setup_inner(
 
     setup_remote_controls(commands, defs, &state);
     setup_scene_basics(commands, server);
+    setup_visual_aids(
+        commands,
+        materials,
+        images,
+        meshes,
+        root,
+        domain,
+        geometry_transform,
+        requests.domain_boxes.as_ref(),
+        requests.infographic.as_ref(),
+    )?;
 
     for request in requests.isosurfaces {
         replace_isosurface_request(commands, defs, &mut state, request);
@@ -395,6 +425,200 @@ fn combined_domain(timesteps: &[TimestepInfo]) -> ([f64; 3], [f64; 3]) {
         }
     }
     (minimum, maximum)
+}
+
+fn make_isosurface_material(
+    texture: Option<Handle<Image>>,
+    alpha: f32,
+    transmission: f32,
+) -> StandardMaterial {
+    let base_color = if texture.is_some() {
+        Color::srgba(1.0, 1.0, 1.0, alpha)
+    } else {
+        Color::srgba(0.2, 0.72, 0.86, alpha)
+    };
+    StandardMaterial {
+        base_color,
+        base_color_texture: texture,
+        alpha_mode: if alpha < 1.0 {
+            AlphaMode::Blend
+        } else {
+            AlphaMode::Opaque
+        },
+        specular_transmission: transmission,
+        perceptual_roughness: 0.55,
+        metallic: 0.0,
+        ..default()
+    }
+}
+
+fn build_isosurface_material_overrides(
+    requests: &[IsoRequest],
+    colormap: &Handle<Image>,
+    materials: &mut Assets<StandardMaterial>,
+) -> HashMap<SurfaceStyle, SurfaceMaterials> {
+    let mut overrides = HashMap::new();
+    for request in requests {
+        let style = SurfaceStyle::from(request);
+        if (request.alpha, request.transmission) == (1.0, 0.0) || overrides.contains_key(&style) {
+            continue;
+        }
+        overrides.insert(
+            style,
+            SurfaceMaterials {
+                plain: materials.add(make_isosurface_material(
+                    None,
+                    request.alpha,
+                    request.transmission,
+                )),
+                colored: materials.add(make_isosurface_material(
+                    Some(colormap.clone()),
+                    request.alpha,
+                    request.transmission,
+                )),
+            },
+        );
+    }
+    overrides
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setup_visual_aids(
+    commands: &mut Commands,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    meshes: &mut Assets<Mesh>,
+    root: Entity,
+    domain: ([f64; 3], [f64; 3]),
+    geometry_transform: Transform,
+    domain_boxes: Option<&DomainBoxes>,
+    infographic: Option<&Infographic>,
+) -> Result<()> {
+    if let Some(config) = domain_boxes {
+        spawn_domain_boxes(
+            commands,
+            materials,
+            meshes,
+            root,
+            domain,
+            geometry_transform,
+            config,
+        )?;
+    }
+    if let Some(config) = infographic {
+        spawn_infographic(commands, materials, images, meshes, config)?;
+    }
+    Ok(())
+}
+
+fn spawn_domain_boxes(
+    commands: &mut Commands,
+    materials: &mut Assets<StandardMaterial>,
+    meshes: &mut Assets<Mesh>,
+    root: Entity,
+    (min, max): ([f64; 3], [f64; 3]),
+    geometry_transform: Transform,
+    config: &DomainBoxes,
+) -> Result<()> {
+    let extent = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    ensure!(
+        extent[0] > 0.0 && extent[1] > 0.0,
+        "domain boxes require positive x and y extents"
+    );
+    let longest_extent = extent.into_iter().fold(0.0_f64, f64::max);
+    let thickness = config.thickness.unwrap_or(longest_extent * 0.01);
+    ensure!(
+        extent[0] as f32 > 0.0
+            && (extent[0] as f32).is_finite()
+            && extent[1] as f32 > 0.0
+            && (extent[1] as f32).is_finite()
+            && thickness as f32 > 0.0
+            && (thickness as f32).is_finite(),
+        "domain box dimensions cannot be represented"
+    );
+    let mesh = meshes.add(Cuboid::new(
+        extent[0] as f32,
+        extent[1] as f32,
+        thickness as f32,
+    ));
+    let center_x = ((min[0] + max[0]) * 0.5) as f32;
+    let center_y = ((min[1] + max[1]) * 0.5) as f32;
+    let locations = [
+        (
+            "Bottom Domain Box",
+            min[2] - thickness * 0.5,
+            config.bottom_color,
+        ),
+        ("Top Domain Box", max[2] + thickness * 0.5, config.top_color),
+    ];
+
+    for (name, z, color) in locations {
+        let material = materials.add(StandardMaterial {
+            base_color: Color::srgba(color[0], color[1], color[2], color[3]),
+            alpha_mode: if color[3] < 1.0 {
+                AlphaMode::Blend
+            } else {
+                AlphaMode::Opaque
+            },
+            perceptual_roughness: 0.8,
+            ..default()
+        });
+        let local = Transform::from_xyz(center_x, center_y, z as f32);
+        commands.spawn((
+            Name::new(name),
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(material),
+            geometry_transform.mul_transform(local),
+            ChildOf(root),
+            NotShadowCaster,
+        ));
+    }
+    Ok(())
+}
+
+fn spawn_infographic(
+    commands: &mut Commands,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    meshes: &mut Assets<Mesh>,
+    config: &Infographic,
+) -> Result<()> {
+    let image = load_infographic_image(&config.image)?;
+    let image_size = image.texture_descriptor.size;
+    ensure!(
+        image_size.width > 0 && image_size.height > 0,
+        "infographic image must have nonzero dimensions"
+    );
+    let width = 0.5 * config.scale;
+    let height = width * image_size.height as f32 / image_size.width as f32;
+    ensure!(
+        width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0,
+        "infographic dimensions cannot be represented"
+    );
+    let image = images.add(image);
+    let mesh = meshes.add(Plane3d::new(Vec3::Z, Vec2::new(width, height) * 0.5).mesh());
+    let material = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        base_color_texture: Some(image),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+    let position = Vec3::from_array(config.position);
+    let look_at = Vec3::from_array(config.look_at);
+    commands.spawn((
+        Name::new("Infographic"),
+        Mesh3d(mesh),
+        MeshMaterial3d(material),
+        // A Plane3d with a +Z normal faces opposite Transform::forward(), so
+        // point forward away from look_at to present the front of the poster.
+        Transform::from_translation(position).looking_to(position - look_at, Dir3::Y),
+        NotShadowCaster,
+        NotShadowReceiver,
+    ));
+    Ok(())
 }
 
 fn color_ramp_image() -> Image {
@@ -765,11 +989,20 @@ fn on_set_colormap(
     };
     let image = state.colormaps[index].image.clone();
 
-    let Some(mut material) = materials.get_mut(&state.colored_isosurface_material) else {
-        error!("colored isosurface material is unavailable");
-        return;
-    };
-    material.base_color_texture = Some(image);
+    {
+        let Some(mut material) = materials.get_mut(&state.colored_isosurface_material) else {
+            error!("colored isosurface material is unavailable");
+            return;
+        };
+        material.base_color_texture = Some(image.clone());
+    }
+    for override_materials in state.isosurface_material_overrides.values() {
+        let Some(mut material) = materials.get_mut(&override_materials.colored) else {
+            error!("colored isosurface override material is unavailable");
+            continue;
+        };
+        material.base_color_texture = Some(image.clone());
+    }
 
     state.current_colormap = index;
     info!("using isosurface colormap {choice:?}");
@@ -1128,10 +1361,8 @@ fn commit_pending(commands: &mut Commands, state: &mut ViewerState, root: Entity
         };
         let material = if key.is_slice() {
             slice_material_for_key(state, &key)
-        } else if key.is_colored_isosurface() {
-            state.colored_isosurface_material.clone()
         } else {
-            state.isosurface_material.clone()
+            isosurface_material_for_key(state, &key)
         };
 
         info!("Spawning new mesh...");
@@ -1201,6 +1432,26 @@ fn slice_material_for_key(state: &ViewerState, key: &GeometryKey) -> Handle<Stan
         return state.slice_material.clone();
     };
     state.slice_override_materials[*index].clone()
+}
+
+fn isosurface_material_for_key(state: &ViewerState, key: &GeometryKey) -> Handle<StandardMaterial> {
+    let colored = key.is_colored_isosurface();
+    let archive_path = &state.timesteps[state.current].archive_path;
+    let override_materials = state
+        .isosurface_requests
+        .iter()
+        .find(|request| GeometryJob::isosurface(archive_path, request).key == *key)
+        .and_then(|request| {
+            state
+                .isosurface_material_overrides
+                .get(&SurfaceStyle::from(request))
+        });
+    match (colored, override_materials) {
+        (true, Some(materials)) => materials.colored.clone(),
+        (false, Some(materials)) => materials.plain.clone(),
+        (true, None) => state.colored_isosurface_material.clone(),
+        (false, None) => state.isosurface_material.clone(),
+    }
 }
 
 fn spin_loading_indicator(
@@ -1273,11 +1524,21 @@ mod tests {
     }
 
     #[test]
+    fn isosurface_material_applies_alpha_and_specular_transmission() {
+        let material = make_isosurface_material(None, 0.4, 0.75);
+        assert_eq!(material.base_color.to_srgba().alpha, 0.4);
+        assert_eq!(material.alpha_mode, AlphaMode::Blend);
+        assert_eq!(material.specular_transmission, 0.75);
+    }
+
+    #[test]
     fn preserves_multiple_distinct_isosurfaces_in_one_geometry_batch() {
         let archive = PathBuf::from("step.msg");
         let requests = [
             IsoRequest {
                 key: IsoKey::new("density", 0.25),
+                alpha: 1.0,
+                transmission: 0.0,
                 color: None,
                 flip: false,
                 decimation: None,
@@ -1285,6 +1546,8 @@ mod tests {
             },
             IsoRequest {
                 key: IsoKey::new("density", 0.75),
+                alpha: 1.0,
+                transmission: 0.0,
                 color: None,
                 flip: true,
                 decimation: None,

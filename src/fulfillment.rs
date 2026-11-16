@@ -645,6 +645,8 @@ mod tests {
     fn geometry_keys_include_the_archive_path() {
         let request = IsoRequest {
             key: IsoKey::new("E", 1.0e19),
+            alpha: 1.0,
+            transmission: 0.0,
             color: None,
             flip: false,
             decimation: None,
@@ -659,6 +661,8 @@ mod tests {
     fn geometry_keys_distinguish_flipped_isosurfaces() {
         let request = |flip| IsoRequest {
             key: IsoKey::new("E", 1.0e19),
+            alpha: 1.0,
+            transmission: 0.0,
             color: None,
             flip,
             decimation: None,
@@ -676,6 +680,8 @@ mod tests {
     fn geometry_keys_distinguish_decimation_targets() {
         let request = |decimation| IsoRequest {
             key: IsoKey::new("E", 1.0e19),
+            alpha: 1.0,
+            transmission: 0.0,
             color: None,
             flip: false,
             decimation,
@@ -694,6 +700,8 @@ mod tests {
     fn geometry_keys_distinguish_relaxation_options() {
         let request = |relaxation| IsoRequest {
             key: IsoKey::new("E", 1.0e19),
+            alpha: 1.0,
+            transmission: 0.0,
             color: None,
             flip: false,
             decimation: None,
@@ -757,6 +765,8 @@ mod tests {
             .unwrap();
         let request = IsoRequest {
             key: IsoKey::new("E", 1.0e19),
+            alpha: 1.0,
+            transmission: 0.0,
             color: Some(ColorRequest {
                 quantity: "H".into(),
                 range: 0.0..=1.0e19,

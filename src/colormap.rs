@@ -90,11 +90,19 @@ pub(crate) fn select_colormap(
 }
 
 pub(crate) fn load_colormap_image(path: &Path) -> Result<Image> {
-    let bytes = fs::read(path).with_context(|| format!("reading colormap {}", path.display()))?;
+    load_image(path, "colormap")
+}
+
+pub(crate) fn load_infographic_image(path: &Path) -> Result<Image> {
+    load_image(path, "infographic")
+}
+
+fn load_image(path: &Path, kind: &str) -> Result<Image> {
+    let bytes = fs::read(path).with_context(|| format!("reading {kind} {}", path.display()))?;
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
-        .with_context(|| format!("colormap {} has no file extension", path.display()))?;
+        .with_context(|| format!("{kind} {} has no file extension", path.display()))?;
     Image::from_buffer(
         &bytes,
         ImageType::Extension(extension),
@@ -103,7 +111,7 @@ pub(crate) fn load_colormap_image(path: &Path) -> Result<Image> {
         ImageSampler::Descriptor(ImageSamplerDescriptor::linear()),
         RenderAssetUsages::default(),
     )
-    .with_context(|| format!("decoding colormap {}", path.display()))
+    .with_context(|| format!("decoding {kind} {}", path.display()))
 }
 
 fn default_builtin(builtins: &[BuiltinColorMap]) -> Option<usize> {

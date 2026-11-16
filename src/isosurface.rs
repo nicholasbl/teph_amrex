@@ -24,12 +24,37 @@ struct DirectoryConfig {
     isosurfaces: Vec<ConfigIsosurface>,
     #[serde(default)]
     slices: Vec<ConfigSlice>,
+    domain_boxes: Option<ConfigDomainBoxes>,
+    infographic: Option<ConfigInfographic>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigDomainBoxes {
+    #[serde(default)]
+    enabled: bool,
+    thickness: Option<f64>,
+    top_color: Option<[f64; 4]>,
+    bottom_color: Option<[f64; 4]>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigInfographic {
+    #[serde(default)]
+    enabled: bool,
+    image: String,
+    position: [f64; 3],
+    look_at: [f64; 3],
+    scale: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ConfigIsosurface {
     quantity: String,
     value: f64,
+    alpha: Option<f64>,
+    transmission: Option<f64>,
     color_by: Option<String>,
     color_min: Option<f64>,
     color_max: Option<f64>,
@@ -95,6 +120,8 @@ impl IsoKey {
 #[derive(Debug, Clone)]
 pub(crate) struct IsoRequest {
     pub(crate) key: IsoKey,
+    pub(crate) alpha: f32,
+    pub(crate) transmission: f32,
     pub(crate) color: Option<ColorRequest>,
     pub(crate) flip: bool,
     pub(crate) decimation: Option<Decimation>,
@@ -169,6 +196,23 @@ pub(crate) struct InitialRequests {
     pub(crate) relaxation: Option<Relaxation>,
     pub(crate) isosurfaces: Vec<IsoRequest>,
     pub(crate) slices: Vec<SliceRequest>,
+    pub(crate) domain_boxes: Option<DomainBoxes>,
+    pub(crate) infographic: Option<Infographic>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DomainBoxes {
+    pub(crate) thickness: Option<f64>,
+    pub(crate) top_color: [f32; 4],
+    pub(crate) bottom_color: [f32; 4],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Infographic {
+    pub(crate) image: std::path::PathBuf,
+    pub(crate) position: [f32; 3],
+    pub(crate) look_at: [f32; 3],
+    pub(crate) scale: f32,
 }
 
 pub(crate) fn parse_isosurface_command(text: &str, fields: &HashSet<String>) -> Result<IsoRequest> {
@@ -190,6 +234,8 @@ pub(crate) fn parse_isosurface_command(text: &str, fields: &HashSet<String>) -> 
     };
     Ok(IsoRequest {
         key: IsoKey::new(quantity, value),
+        alpha: 1.0,
+        transmission: 0.0,
         color: None,
         flip,
         decimation: None,
@@ -252,6 +298,18 @@ pub(crate) fn load_initial_requests(
         .map(parse_decimation)
         .transpose()?;
     let default_relaxation = config.relax.as_ref().map(parse_relaxation).transpose()?;
+    let domain_boxes = config
+        .domain_boxes
+        .as_ref()
+        .filter(|boxes| boxes.enabled)
+        .map(parse_domain_boxes)
+        .transpose()?;
+    let infographic = config
+        .infographic
+        .as_ref()
+        .filter(|infographic| infographic.enabled)
+        .map(|infographic| parse_infographic(dir, infographic))
+        .transpose()?;
 
     let isosurfaces = config
         .isosurfaces
@@ -293,6 +351,11 @@ pub(crate) fn load_initial_requests(
             };
             Ok(IsoRequest {
                 key: IsoKey::new(surface.quantity, surface.value),
+                alpha: parse_unit_interval(surface.alpha.unwrap_or(1.0), "isosurface alpha")?,
+                transmission: parse_unit_interval(
+                    surface.transmission.unwrap_or(0.0),
+                    "isosurface transmission",
+                )?,
                 color,
                 flip: surface.flip,
                 decimation: surface
@@ -366,7 +429,92 @@ pub(crate) fn load_initial_requests(
         relaxation: default_relaxation,
         isosurfaces,
         slices,
+        domain_boxes,
+        infographic,
     })
+}
+
+fn parse_domain_boxes(config: &ConfigDomainBoxes) -> Result<DomainBoxes> {
+    if let Some(thickness) = config.thickness {
+        ensure!(
+            thickness.is_finite() && thickness > 0.0,
+            "domain box thickness must be finite and positive"
+        );
+    }
+    Ok(DomainBoxes {
+        thickness: config.thickness,
+        top_color: parse_rgba(config.top_color.unwrap_or([0.2, 0.55, 0.95, 0.35]))?,
+        bottom_color: parse_rgba(config.bottom_color.unwrap_or([0.95, 0.35, 0.15, 0.35]))?,
+    })
+}
+
+fn parse_infographic(dir: &Path, config: &ConfigInfographic) -> Result<Infographic> {
+    ensure!(
+        !config.image.trim().is_empty(),
+        "infographic image must not be empty"
+    );
+    let position = parse_vec3(config.position, "infographic position")?;
+    let look_at = parse_vec3(config.look_at, "infographic look_at")?;
+    ensure!(
+        position != look_at,
+        "infographic position and look_at must differ"
+    );
+    let scale = config.scale.unwrap_or(1.0);
+    ensure!(
+        scale.is_finite() && scale > 0.0,
+        "infographic scale must be finite and positive"
+    );
+    let scale = scale as f32;
+    ensure!(scale.is_finite(), "infographic scale is too large");
+    let configured_path = Path::new(&config.image);
+    let image = if configured_path.is_absolute() {
+        configured_path.to_owned()
+    } else {
+        dir.join(configured_path)
+    };
+    ensure!(
+        image.is_file(),
+        "infographic image {} is not a file",
+        image.display()
+    );
+
+    Ok(Infographic {
+        image,
+        position,
+        look_at,
+        scale,
+    })
+}
+
+fn parse_rgba(color: [f64; 4]) -> Result<[f32; 4]> {
+    ensure!(
+        color
+            .into_iter()
+            .all(|channel| channel.is_finite() && (0.0..=1.0).contains(&channel)),
+        "domain box RGBA channels must be finite and in [0, 1]"
+    );
+    Ok(color.map(|channel| channel as f32))
+}
+
+fn parse_vec3(value: [f64; 3], label: &str) -> Result<[f32; 3]> {
+    ensure!(
+        value.into_iter().all(f64::is_finite),
+        "{label} components must be finite"
+    );
+    let value = value.map(|component| component as f32);
+    ensure!(
+        value.into_iter().all(f32::is_finite),
+        "{label} components are too large"
+    );
+    Ok(value)
+}
+
+fn parse_unit_interval(value: f64, label: &str) -> Result<f32> {
+    ensure!(
+        value.is_finite() && (0.0..=1.0).contains(&value),
+        "{label} must be finite and in [0, 1]"
+    );
+    Ok(value as f32)
 }
 
 fn parse_decimation(config: &ConfigDecimation) -> Result<Decimation> {
@@ -474,10 +622,77 @@ mod tests {
     }
 
     #[test]
+    fn loads_domain_boxes_and_world_space_infographic() {
+        let directory = std::env::temp_dir().join(format!(
+            "teph_amrex_visual_aids_config_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("poster.png"), b"placeholder").unwrap();
+        fs::write(
+            directory.join(CONFIG_FILE),
+            r#"
+                [domain_boxes]
+                enabled = true
+                thickness = 0.25
+                top_color = [0.1, 0.2, 0.3, 0.4]
+                bottom_color = [0.5, 0.6, 0.7, 0.8]
+
+                [infographic]
+                enabled = true
+                image = "poster.png"
+                position = [1.0, 2.0, 3.0]
+                look_at = [0.0, 2.0, 3.0]
+                scale = 1.5
+            "#,
+        )
+        .unwrap();
+
+        let requests = load_initial_requests(&directory, &fields()).unwrap();
+        let boxes = requests.domain_boxes.unwrap();
+        assert_eq!(boxes.thickness, Some(0.25));
+        assert_eq!(boxes.top_color, [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(boxes.bottom_color, [0.5, 0.6, 0.7, 0.8]);
+        let infographic = requests.infographic.unwrap();
+        assert_eq!(infographic.image, directory.join("poster.png"));
+        assert_eq!(infographic.position, [1.0, 2.0, 3.0]);
+        assert_eq!(infographic.look_at, [0.0, 2.0, 3.0]);
+        assert_eq!(infographic.scale, 1.5);
+
+        fs::remove_file(directory.join(CONFIG_FILE)).unwrap();
+        fs::remove_file(directory.join("poster.png")).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_visual_aid_values() {
+        assert!(
+            parse_domain_boxes(&ConfigDomainBoxes {
+                enabled: true,
+                thickness: Some(0.0),
+                top_color: None,
+                bottom_color: None,
+            })
+            .is_err()
+        );
+        assert!(
+            parse_domain_boxes(&ConfigDomainBoxes {
+                enabled: true,
+                thickness: None,
+                top_color: Some([1.1, 0.0, 0.0, 1.0]),
+                bottom_color: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parses_isosurface_command_without_flip() {
         let request = parse_isosurface_command("density 0.5", &fields()).unwrap();
         assert_eq!(request.key.quantity, "density");
         assert_eq!(request.key.value(), 0.5);
+        assert_eq!(request.alpha, 1.0);
+        assert_eq!(request.transmission, 0.0);
         assert!(!request.flip);
     }
 
@@ -590,6 +805,8 @@ mod tests {
                 [[isosurfaces]]
                 quantity = "density"
                 value = 0.5
+                alpha = 0.65
+                transmission = 0.4
                 color_by = "temp"
                 color_min = -10.0
                 color_max = 10.0
@@ -611,6 +828,8 @@ mod tests {
         assert_eq!(requests.slice_colormap.as_deref(), Some("viridis.png"));
         assert_eq!(requests.decimation, Some(Decimation::Percentage(25.0)));
         let request = &requests.isosurfaces[0];
+        assert_eq!(request.alpha, 0.65);
+        assert_eq!(request.transmission, 0.4);
         assert_eq!(request.decimation, Some(Decimation::Percentage(25.0)));
         assert_eq!(request.relaxation.as_ref().unwrap().iterations, 4);
         let color = request.color.as_ref().unwrap();
@@ -648,6 +867,25 @@ mod tests {
 
         fs::remove_file(directory.join(CONFIG_FILE)).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn rejects_out_of_range_isosurface_material_values() {
+        for text in [
+            "[[isosurfaces]]\nquantity = \"density\"\nvalue = 0.5\nalpha = -0.1",
+            "[[isosurfaces]]\nquantity = \"density\"\nvalue = 0.5\ntransmission = 1.1",
+        ] {
+            let directory = std::env::temp_dir().join(format!(
+                "teph_amrex_invalid_material_config_{}_{}",
+                std::process::id(),
+                text.len()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join(CONFIG_FILE), text).unwrap();
+            assert!(load_initial_requests(&directory, &fields()).is_err());
+            fs::remove_file(directory.join(CONFIG_FILE)).unwrap();
+            fs::remove_dir(directory).unwrap();
+        }
     }
 
     #[test]
