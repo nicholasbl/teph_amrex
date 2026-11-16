@@ -882,7 +882,7 @@ fn setup_scene_basics(commands: &mut Commands, server: &AssetServer) {
         diffuse: server.load("ibl/workshop_diffuse.ktx2"),
         specular: server.load("ibl/workshop_specular.ktx2"),
         intensity: 5000.0,
-        skybox_color: Color::srgb(0.5, 0.5, 1.0).into(),
+        skybox_color: Color::srgb(0.2, 0.2, 1.0).into(),
     });
 }
 
