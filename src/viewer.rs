@@ -506,7 +506,16 @@ fn setup_visual_aids(
         )?;
     }
     if let Some(config) = infographic {
+        info!(
+            "infographic configured: image={}, position={:?}, look_at={:?}, scale={}",
+            config.image.display(),
+            config.position,
+            config.look_at,
+            config.scale,
+        );
         spawn_infographic(commands, materials, images, meshes, config)?;
+    } else {
+        info!("infographic disabled or not configured; skipping image load");
     }
     Ok(())
 }
@@ -583,8 +592,16 @@ fn spawn_infographic(
     meshes: &mut Assets<Mesh>,
     config: &Infographic,
 ) -> Result<()> {
+    info!("loading infographic image {}", config.image.display());
     let image = load_infographic_image(&config.image)?;
     let image_size = image.texture_descriptor.size;
+    info!(
+        "decoded infographic image {} ({}x{} pixels, format {:?})",
+        config.image.display(),
+        image_size.width,
+        image_size.height,
+        image.texture_descriptor.format,
+    );
     ensure!(
         image_size.width > 0 && image_size.height > 0,
         "infographic image must have nonzero dimensions"
@@ -608,16 +625,22 @@ fn spawn_infographic(
     });
     let position = Vec3::from_array(config.position);
     let look_at = Vec3::from_array(config.look_at);
-    commands.spawn((
-        Name::new("Infographic"),
-        Mesh3d(mesh),
-        MeshMaterial3d(material),
-        // A Plane3d with a +Z normal faces opposite Transform::forward(), so
-        // point forward away from look_at to present the front of the poster.
-        Transform::from_translation(position).looking_to(position - look_at, Dir3::Y),
-        NotShadowCaster,
-        NotShadowReceiver,
-    ));
+    let entity = commands
+        .spawn((
+            Name::new("Infographic"),
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            // A Plane3d with a +Z normal faces opposite Transform::forward(), so
+            // point forward away from look_at to present the front of the poster.
+            Transform::from_translation(position).looking_to(position - look_at, Dir3::Y),
+            NotShadowCaster,
+            NotShadowReceiver,
+        ))
+        .id();
+    info!(
+        "spawned infographic entity {:?}: world size {:.3}m x {:.3}m, position {:?}, look_at {:?}",
+        entity, width, height, position, look_at,
+    );
     Ok(())
 }
 
